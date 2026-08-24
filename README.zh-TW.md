@@ -147,6 +147,52 @@ curl "$SERVICE_URL/recipients"
 | POST | `/test-notification` | 測試全部收件人 |
 | POST | `/test-recipient?name=...` | 只測一位收件人 |
 
+## 快速測試指令
+
+先取得目前 Cloud Run URL：
+
+```bash
+SERVICE_URL=$(gcloud run services describe hk-weather-whatsapp-poc \
+  --region asia-east2 \
+  --format='value(status.url)')
+
+echo "$SERVICE_URL"
+```
+
+接著可直接使用以下指令做日常檢查：
+
+```bash
+# 1. 確認 Cloud Run 版本與收件人模式
+curl "$SERVICE_URL/health"
+
+# 2. 檢查所有官方來源
+# 注意：/sources 是 GET，而且路徑為小寫
+curl "$SERVICE_URL/sources"
+
+# 3. 查看 Google Sheet 收件人的驗證狀態
+curl "$SERVICE_URL/recipients"
+
+# 4. 測試 Google Sheet 裡全部收件人
+curl -X POST "$SERVICE_URL/test-notification"
+
+# 5. 只測試一位指定收件人
+TEST_RECIPIENT="Jackie"
+curl -X POST "$SERVICE_URL/test-recipient?name=$TEST_RECIPIENT"
+
+# 6. 手動執行一次正式天氣檢查
+# 只有符合通知條件且狀態有變化時才會真正發送 WhatsApp
+curl -X POST "$SERVICE_URL/check"
+```
+
+如果要測另一位新人，只需要改：
+
+```bash
+TEST_RECIPIENT="Amy"
+curl -X POST "$SERVICE_URL/test-recipient?name=$TEST_RECIPIENT"
+```
+
+`/test-notification` 會發給 Sheet 中所有有效收件人；`/test-recipient` 只會發給指定姓名的人；`/sources` 不會發 WhatsApp，只用來確認官方來源是否正常。
+
 ## 升級到 v0.4.1
 
 ```bash
