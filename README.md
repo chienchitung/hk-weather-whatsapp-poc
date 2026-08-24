@@ -1,6 +1,6 @@
 # HK Weather & School WhatsApp Notification PoC
 
-A proof of concept that monitors official Hong Kong severe-weather and school-suspension information, detects meaningful state changes, and sends WhatsApp alerts through CallMeBot.
+A proof of concept that monitors official Hong Kong severe-weather and school-suspension information, detects meaningful state changes, and sends human-readable WhatsApp alerts through CallMeBot.
 
 > This project is intended for personal / technical PoC use. For organization-wide employee notifications, use an enterprise messaging channel such as the official WhatsApp Business Cloud API.
 
@@ -41,7 +41,7 @@ State Comparison / Deduplication
       └── State changed
               │
               ▼
-         Message Formatter
+     Human-readable Message Formatter
               │
               ▼
            CallMeBot
@@ -61,9 +61,64 @@ State Comparison / Deduplication
 
 No API key is required for these Hong Kong government data sources.
 
+## Source health verification
+
+The service reports each source separately. This is important because `events: []` alone does **not** prove that all sources were reachable.
+
+Use:
+
+```bash
+curl https://YOUR_SERVICE_URL/sources
+```
+
+A healthy response looks like:
+
+```json
+{
+  "source_health": "ok",
+  "sources": [
+    {
+      "name": "hko_warning_summary",
+      "source": "香港天文台－警告摘要",
+      "ok": true,
+      "events_found": 0,
+      "detail": "來源讀取與解析成功，目前沒有符合通知條件的事件"
+    },
+    {
+      "name": "hko_special_weather_tips",
+      "source": "香港天文台－特別天氣提示",
+      "ok": true,
+      "events_found": 0
+    },
+    {
+      "name": "edb_latest_news",
+      "source": "香港教育局－最新消息",
+      "ok": true,
+      "events_found": 0
+    },
+    {
+      "name": "govhk_press_release",
+      "source": "香港政府新聞公報",
+      "ok": true,
+      "events_found": 0
+    }
+  ],
+  "errors": []
+}
+```
+
+Interpretation:
+
+- `source_health = ok` → all configured official sources were fetched and parsed successfully.
+- `ok = true` + `events_found = 0` → source worked, but there is currently no matching alert.
+- `ok = false` → that source failed to fetch or parse; `/check` will return `source_health = degraded`.
+- `errors = []` → no source-level errors occurred.
+
+`POST /check` also includes the same `sources` array, so each scheduled run can be audited.
+
 ## Events currently monitored
 
-| Event | Normalized status | Notification level |
+| Event | Internal status | Notification level |
 |---|---|---|
 | Tropical Cyclone Signal No. 1 | `T1` | INFO |
 | Tropical Cyclone Signal No. 3 | `T3` | INFO |
@@ -76,6 +131,42 @@ No API key is required for these Hong Kong government data sources.
 | Black Rainstorm | `BLACK_RAIN` | ACTION_REQUIRED |
 | Extreme Conditions | `EXTREME_CONDITIONS` | ACTION_REQUIRED |
 | EDB class suspension | `SUSPENDED` | ACTION_REQUIRED |
+
+Internal codes are used only for logic. WhatsApp recipients receive natural-language labels instead of system codes.
+
+## Human-readable WhatsApp messages
+
+Example — Typhoon Signal No. 8:
+
+```text
+🔴 香港天氣警報｜八號烈風或暴風信號已生效
+
+八號東南烈風或暴風信號
+目前狀況：八號烈風或暴風信號
+前一狀況：三號強風信號
+
+📌 請避免不必要外出，留意交通及安全情況；工作安排請依公司內部惡劣天氣政策執行。
+
+發布單位：香港天文台
+更新時間：2026-08-24 16:10 HKT
+官方公告：https://...
+```
+
+Example — school suspension:
+
+```text
+🎓 停課通知｜教育局最新安排
+
+教育局宣布上午校及全日制學校停課
+目前狀況：停課
+適用範圍：上午校、全日制學校
+
+📌 請家長及學生留意教育局的最新安排，並以官方公告為準。
+
+發布單位：香港教育局
+更新時間：2026-08-24 16:10 HKT
+官方公告：https://...
+```
 
 ## Notification behavior
 
@@ -123,15 +214,23 @@ Two safety settings are enabled by default:
 
 ### `GET /health`
 
-Health check for Cloud Run.
+Cloud Run process health check.
 
 ```bash
 curl http://localhost:8080/health
 ```
 
+### `GET /sources`
+
+Fetch and verify every configured official source without sending notifications.
+
+```bash
+curl http://localhost:8080/sources
+```
+
 ### `POST /check`
 
-Fetch all official sources, normalize events, compare state, and send notifications when applicable.
+Fetch all official sources, report source health, normalize events, compare state, and send notifications when applicable.
 
 ```bash
 curl -X POST http://localhost:8080/check
@@ -139,7 +238,7 @@ curl -X POST http://localhost:8080/check
 
 ### `POST /test-notification`
 
-Test WhatsApp message formatting and CallMeBot delivery.
+Test human-readable WhatsApp formatting and CallMeBot delivery.
 
 ```bash
 curl -X POST http://localhost:8080/test-notification
@@ -151,44 +250,22 @@ With `DRY_RUN=true`, the message is returned in the response but is not sent.
 
 # Local development
 
-## 1. Clone the repository
-
 ```bash
 git clone https://github.com/chienchitung/hk-weather-whatsapp-poc.git
 cd hk-weather-whatsapp-poc
-```
-
-## 2. Create a virtual environment
-
-macOS / Linux:
-
-```bash
 python -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
 ```
 
-Windows:
+Windows activation:
 
 ```bash
-python -m venv .venv
 .venv\Scripts\activate
 ```
 
-## 3. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-## 4. Configure environment variables
-
-Copy the example file:
-
-```bash
-cp .env.example .env
-```
-
-Safe development defaults:
+Safe environment defaults:
 
 ```text
 DRY_RUN=true
@@ -199,90 +276,38 @@ STATE_PATH=/tmp/hk-weather-whatsapp-state.json
 PORT=8080
 ```
 
-## 5. Start the API
-
-```bash
-python app.py
-```
-
-The local service runs at:
-
-```text
-http://localhost:8080
-```
-
-## 6. Test the service
-
-```bash
-curl http://localhost:8080/health
-curl -X POST http://localhost:8080/check
-curl -X POST http://localhost:8080/test-notification
-```
-
 ---
 
 # CallMeBot setup
 
 A CallMeBot API key is required only when you want to send a real WhatsApp notification.
 
-After CallMeBot activates your WhatsApp number, configure:
+Configure:
 
 ```text
-CALLMEBOT_PHONE=+852XXXXXXXX
+CALLMEBOT_PHONE=your_phone_number
 CALLMEBOT_API_KEY=your_api_key
 DRY_RUN=false
 ```
 
-Do **not** commit your real phone number or API key into GitHub.
-
-The `.env` file is excluded by `.gitignore`.
-
-For Google Cloud, store the credentials as Cloud Run environment variables or, preferably, Google Secret Manager secrets.
+Do **not** commit your real phone number or API key into GitHub. For Google Cloud, prefer Secret Manager for credentials.
 
 ---
 
 # Deploy to Google Cloud Run
 
-Recommended region for this PoC:
+Recommended region:
 
 ```text
 asia-east2 (Hong Kong)
 ```
 
-## 1. Create a Google Cloud project
-
-Create a project in Google Cloud Console and attach a billing account.
-
-Example project name:
-
-```text
-hk-weather-whatsapp-poc
-```
-
-## 2. Open Google Cloud Shell
-
-Confirm the selected project:
-
-```bash
-gcloud config get-value project
-```
-
-If necessary:
-
-```bash
-gcloud config set project YOUR_PROJECT_ID
-```
-
-## 3. Clone this repository
+From Cloud Shell:
 
 ```bash
 git clone https://github.com/chienchitung/hk-weather-whatsapp-poc.git
 cd hk-weather-whatsapp-poc
-```
 
-## 4. Deploy safely in DRY RUN mode
-
-```bash
 gcloud run deploy hk-weather-whatsapp-poc \
   --source . \
   --region asia-east2 \
@@ -290,36 +315,30 @@ gcloud run deploy hk-weather-whatsapp-poc \
   --set-env-vars DRY_RUN=true,BOOTSTRAP_SILENT=true
 ```
 
-During the first deployment, Google Cloud may ask to enable services such as:
-
-- Cloud Run API
-- Cloud Build API
-- Artifact Registry API
-
-Enable them when prompted.
-
-## 5. Verify Cloud Run
-
-After deployment, Google Cloud returns a service URL similar to:
-
-```text
-https://hk-weather-whatsapp-poc-xxxxx.asia-east2.run.app
-```
-
-Test:
+After deployment:
 
 ```bash
 curl https://YOUR_SERVICE_URL/health
+curl https://YOUR_SERVICE_URL/sources
 curl -X POST https://YOUR_SERVICE_URL/check
 ```
 
-Keep `DRY_RUN=true` until official-source parsing has been verified.
+If updating an already deployed service after a GitHub change:
+
+```bash
+git pull
+
+gcloud run deploy hk-weather-whatsapp-poc \
+  --source . \
+  --region asia-east2 \
+  --allow-unauthenticated
+```
+
+Existing Cloud Run environment variables remain associated with the service unless explicitly changed.
 
 ---
 
 # Configure Cloud Scheduler
-
-Cloud Run only executes when it receives a request. Cloud Scheduler is used to trigger monitoring automatically.
 
 Recommended PoC schedule:
 
@@ -327,13 +346,13 @@ Recommended PoC schedule:
 Every 1–2 minutes
 ```
 
-For every minute, use the cron expression:
+Every minute cron:
 
 ```text
 * * * * *
 ```
 
-Configure the Scheduler job as:
+Scheduler target:
 
 ```text
 Name: hk-weather-check
@@ -344,138 +363,36 @@ URL: https://YOUR_SERVICE_URL/check
 Time zone: Asia/Hong_Kong
 ```
 
-Because the PoC deployment uses `--allow-unauthenticated`, Scheduler can call `/check` without authentication.
-
-For a production implementation, protect the endpoint and use authenticated Scheduler requests.
-
----
-
-# Enable real WhatsApp notifications
-
-After Cloud Run + Scheduler are verified:
-
-1. Obtain the CallMeBot API key.
-2. Add `CALLMEBOT_PHONE`.
-3. Add `CALLMEBOT_API_KEY`.
-4. Change `DRY_RUN` from `true` to `false`.
-5. Deploy a new Cloud Run revision.
-6. Call `/test-notification` first.
-7. Confirm the WhatsApp message arrives before relying on automated alerts.
+For production, protect `/check` with authenticated Scheduler requests.
 
 ---
 
 # Testing
 
-Run unit tests locally:
-
 ```bash
 pytest -q
 ```
 
-Tests currently cover:
-
-- T3 / T8 / T10 parsing
-- Amber / Red / Black Rainstorm parsing
-- Notification level mapping
-- HKO warning normalization
-- Education Bureau suspension parsing
-- School-scope extraction
-
-GitHub Actions also runs the test suite when repository changes are pushed.
+Tests cover typhoon parsing, rainstorm parsing, notification levels, HKO warning normalization, Education Bureau suspension parsing, and school-scope extraction.
 
 ---
 
 # Current PoC limitations
 
-## Ephemeral Cloud Run state
+- State is currently stored at `/tmp/hk-weather-whatsapp-state.json`; Cloud Run local storage is ephemeral.
+- Explicit `ACTIVE → CLEARED` recovery notifications are not yet fully modeled when warnings disappear from HKO's current-warning response.
+- CallMeBot is suitable for personal / small PoC use, not large-scale employee distribution.
+- Government wording can change, so keyword patterns should be validated during real severe-weather events.
 
-The current version stores state in:
+## Recommended next improvements
 
-```text
-/tmp/hk-weather-whatsapp-state.json
-```
-
-Cloud Run local storage is ephemeral. A new instance may not retain the previous state.
-
-This is acceptable for a technical PoC, but not for reliable production deduplication.
-
-## Warning-cleared transitions
-
-v0.1 detects active warning states but does not yet fully model an explicit:
-
-```text
-ACTIVE → CLEARED
-```
-
-transition when a warning disappears from HKO's current-warning response.
-
-## CallMeBot scope
-
-CallMeBot is suitable for personal testing. It should not be treated as the notification infrastructure for large employee groups.
-
-## Keyword-based parsing
-
-Official wording can change. Event patterns should be validated during real severe-weather events.
-
----
-
-# Recommended v0.2 architecture
-
-```text
-Cloud Scheduler
-      ↓
-Cloud Run
-      ↓
-Official Sources
-      ↓
-Event Normalizer
-      ↓
-Rule Engine
-      ↓
-Firestore
-      │
-      ├── durable state
-      └── audit history
-      ↓
-Notification Adapter
-      ├── CallMeBot (PoC)
-      └── WhatsApp Business API (production)
-```
-
-Recommended next improvements:
-
-1. Replace local JSON state with Firestore.
+1. Replace local state with Firestore.
 2. Add explicit warning cancellation / recovery notifications.
-3. Add configurable company work-policy mapping such as `T8 → WFH / do not report`.
+3. Add configurable company work-policy mapping.
 4. Add structured event and notification audit logs.
 5. Add retry handling for failed notifications.
-6. Add Chinese / English message templates.
-7. Add WhatsApp Business Cloud API support for multiple recipients.
-
----
-
-# Cost considerations
-
-For a low-volume PoC, Cloud Run and Cloud Scheduler usage can often remain within Google Cloud free allowances, but a billing account is still normally required.
-
-To reduce the risk of unexpected charges:
-
-- Keep Cloud Run minimum instances at `0`.
-- Keep maximum instances low for this PoC.
-- Configure a Google Cloud Billing Budget & Alert.
-- Review Cloud Build and Artifact Registry usage after deployments.
-
----
-
-# Official references
-
-- GovHK RSS directory: https://www.gov.hk/tc/about/rss.htm
-- HKO Open Data API: https://data.weather.gov.hk/weatherAPI/opendata/weather.php
-- EDB Latest News RSS: https://www.edb.gov.hk/tc/whats_new_rss.xml
-- HKSAR Government Press Release RSS: https://www.info.gov.hk/gia/rss/general_zh.xml
-- CallMeBot WhatsApp endpoint: https://api.callmebot.com/whatsapp.php
-- Google Cloud Run: https://cloud.google.com/run
-- Google Cloud Scheduler: https://cloud.google.com/scheduler
+6. Add Google Sheets recipient management for non-technical administrators.
+7. Add WhatsApp Business Cloud API support for multi-recipient production use.
 
 ## Disclaimer
 
