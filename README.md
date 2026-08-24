@@ -4,207 +4,195 @@
 
 A Google Cloud Run service that monitors official Hong Kong severe-weather and school-suspension information and sends human-readable WhatsApp alerts through CallMeBot.
 
-## v0.4 design
+## Architecture
 
 ```text
-Cloud Scheduler
-      ↓ every minute
+Cloud Scheduler (every minute)
+        ↓
 Cloud Run /check
-      ↓
-Official sources are checked independently
-      ├─ HKO warning summary
-      ├─ HKO special weather tips
-      ├─ Education Bureau RSS
-      └─ HKSAR Government RSS
-      ↓
-Firestore state / deduplication
-      ↓
-Actionable new event only
-      ↓
+        ↓
+Official sources checked independently
+        ├─ HKO warning summary
+        ├─ HKO Special Weather Tips
+        ├─ Education Bureau RSS
+        └─ HKSAR Government RSS
+        ↓
+Firestore durable state + deduplication
+        ↓
+Only a new actionable event
+        ↓
 Recipients
-      ├─ Google Sheet (recommended for a small team)
-      └─ single environment-variable recipient (fallback)
-      ↓
-CallMeBot
-      ↓
-WhatsApp
+        ├─ Google Sheet (multi-recipient)
+        └─ environment variables (single-recipient fallback)
+        ↓
+CallMeBot → WhatsApp
 ```
 
-## Notification behavior
+## Official sources
 
-Cloud Scheduler may call `/check` every minute, but WhatsApp is **not** sent every minute.
+| Source | Used for |
+|---|---|
+| HKO `warnsum` | Tropical cyclone and rainstorm warning states |
+| HKO `swt` | Pre-No. 8 indications / Special Weather Tips |
+| Education Bureau RSS | Official class-suspension notices |
+| HKSAR Government RSS | Extreme Conditions / special government notices |
 
-Only these actionable states can notify:
+No API key is required for these government sources.
 
-- Pre-No. 8
-- T8 / T9 / T10
-- Red Rainstorm
-- Black Rainstorm
-- Extreme Conditions
-- Education Bureau class suspension
+## Notification matrix
 
-T1, T3 and Amber Rain are stored as context but do not notify.
+Cloud Scheduler may call `/check` every minute, but WhatsApp is **not** sent every minute. A message is sent only when a newly observed state is on the notification whitelist and has not already been successfully notified.
 
-### Independent source handling
+| Official state / message | Normalized status | WhatsApp? | Notes |
+|---|---|---:|---|
+| Tropical Cyclone Signal No. 1 | `T1` | No | Stored as context only |
+| Tropical Cyclone Signal No. 3 | `T3` | No | Stored as context only |
+| HKO indicates No. 8 may be issued | `PRE_T8` | **Yes** | Read from HKO Special Weather Tips |
+| Tropical Cyclone Signal No. 8 | `T8` | **Yes** | Actionable alert |
+| Tropical Cyclone Signal No. 9 | `T9` | **Yes** | Actionable alert |
+| Tropical Cyclone Signal No. 10 | `T10` | **Yes** | Actionable alert |
+| Amber Rainstorm Warning | `AMBER_RAIN` | No | Stored as context only |
+| Red Rainstorm Warning | `RED_RAIN` | **Yes** | Actionable alert |
+| Black Rainstorm Warning | `BLACK_RAIN` | **Yes** | Actionable alert |
+| Extreme Conditions | `EXTREME_CONDITIONS` | **Yes** | Government special arrangement |
+| Education Bureau class suspension | `SUSPENDED` | **Yes** | Official school suspension |
+| Very Hot Weather Warning (`WHOT`) | not normalized | No | Source can be read successfully but this warning is intentionally outside the current notification scope |
+| Cold Weather / Thunderstorm / Strong Monsoon and other HKO warnings | not normalized | No | Not part of the current work/school disruption scope |
 
-Each official source is handled independently.
-
-If one source fails, healthy sources continue to work. Example:
+Example:
 
 ```text
-EDB RSS fails
-HKO successfully reports T8
-→ T8 notification is still sent
+10:30 T3        → stored, no message
+11:00 Pre-T8    → WhatsApp once
+11:01 Pre-T8    → no duplicate
+12:00 T8        → WhatsApp once
+12:01 T8        → no duplicate
 ```
 
-A failed source does **not** clear its previous state. Its state is left unchanged until that source becomes healthy again.
+## Source failure behavior
 
-If a source is healthy and a previously active event is no longer present, that event is silently reset to inactive. This allows a future new episode of the same event to notify again without sending unnecessary recovery messages.
+Sources are processed independently. A failure in one source does **not** block a valid event from another healthy source.
 
-## Durable deduplication
+Example:
 
-Firestore stores the latest event state. This prevents Cloud Run restart / scale-to-zero from forgetting what was already processed.
+```text
+EDB RSS unavailable
+HKO reports a new T8
+→ T8 is still sent to CallMeBot
+```
 
-A persistent bootstrap marker also prevents deployment on a quiet day from suppressing the first real future T8.
+A failed source keeps its previous state unchanged until that source becomes healthy again, so a temporary outage is not mistaken for an event cancellation.
 
-## Official data sources
+## Human-readable notification example
 
-| Source | Purpose |
-|---|---|
-| HKO `warnsum` API | Tropical cyclone and rainstorm warnings |
-| HKO `swt` API | Pre-No. 8 / special weather tips |
-| Education Bureau RSS | Class-suspension announcements |
-| HKSAR Government RSS | Extreme Conditions / special government announcements |
+```text
+🔴 Hong Kong Weather Alert | No. 8 signal is in force
 
-No API key is required for these public Hong Kong government sources.
+八號東南烈風或暴風信號
+目前狀況：八號烈風或暴風信號
+前一狀況：三號強風信號
 
----
+📌 請避免不必要外出，留意交通及安全情況；工作安排請依公司內部惡劣天氣政策執行。
 
-# Google Sheet recipient management
+發布單位：香港天文台
+更新時間：2026-08-24 16:10 HKT
+官方公告：https://...
+```
 
-For a small team, Google Sheet can be the non-technical administration interface.
+## Google Sheet recipients
 
-Create a spreadsheet tab named `Recipients` with this header row:
+For a small team, Google Sheet is the intended non-technical maintenance interface.
 
-| name | phone | api_key | enabled | group | language |
-|---|---|---|---|---|---|
-| Jackie | 8869XXXXXXXX | XXXXXXX | TRUE | HK Office | zh-TW |
-| Amy | 8529XXXXXXX | XXXXXXX | TRUE | HK Office | zh-TW |
-| Ben | 8526XXXXXXX | XXXXXXX | FALSE | HK Office | en |
+Create a sheet tab named `Recipients` with **exactly these three columns**:
 
-Only rows with `enabled=TRUE` and both `phone` + `api_key` are used.
+| name | phone | api_key |
+|---|---|---|
+| Jackie | 8869XXXXXXXX | XXXXXXX |
+| Amy | 8529XXXXXXX | XXXXXXX |
 
-### Why the API key is stored in the Sheet
+Rules:
 
-For this small-team PoC, each CallMeBot recipient has their own API key. Storing it in the Sheet makes recipient maintenance independent of the original developer.
+- Every non-empty row with both `phone` and `api_key` is treated as active.
+- To add a recipient, add a new row.
+- To remove a recipient, delete the row.
+- Each recipient must activate CallMeBot and use their own CallMeBot API key.
+- Keep access to this Sheet restricted because it contains API keys.
 
-This is a convenience/security trade-off. Limit Sheet editors to trusted administrators. If possible, protect the `api_key` column from casual editing.
+Current spreadsheet ID:
 
-### Important ownership recommendation
+```text
+1IA5MgL130nSUvhCan2NIhIv7bpxZU1hNK4AChUjMEBI
+```
 
-Do not make long-term automation depend on a departing employee's personal Google account.
+Recommended range:
 
-Prefer one of these:
+```text
+Recipients!A:C
+```
 
-- a company/shared Google Workspace account owns the spreadsheet, or
-- the spreadsheet is stored in a Shared Drive.
+### Give Cloud Run access to the Sheet
 
-Cloud Run itself does **not** need an employee to stay logged in. It runs as a Google Cloud service account.
+Find the runtime service account:
 
-Share the spreadsheet with the Cloud Run runtime service-account email as **Viewer**. Then the service can keep reading updated rows even when the original developer is offline.
+```bash
+PROJECT_NUMBER=$(gcloud projects describe hk-weather-whatsapp-poc --format='value(projectNumber)')
+echo "${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+```
 
-### Enable Google Sheets API
+Share the Google Sheet with that service-account email as **Viewer**. Cloud Run then reads the Sheet independently of any interactive personal login session.
+
+Enable the Sheets API:
 
 ```bash
 gcloud services enable sheets.googleapis.com
 ```
 
-Get the runtime service account used by this PoC:
-
-```bash
-PROJECT_NUMBER=$(gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)')
-echo "${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-```
-
-Share the Google Sheet with that email as Viewer.
-
-The spreadsheet ID is the value between `/d/` and `/edit` in a Google Sheets URL.
-
-Then configure Cloud Run:
+Configure the deployed service:
 
 ```bash
 gcloud run services update hk-weather-whatsapp-poc \
   --region asia-east2 \
-  --update-env-vars RECIPIENTS_SHEET_ID=YOUR_SPREADSHEET_ID,RECIPIENTS_SHEET_RANGE=Recipients!A:F
+  --update-env-vars RECIPIENTS_SHEET_ID=1IA5MgL130nSUvhCan2NIhIv7bpxZU1hNK4AChUjMEBI,RECIPIENTS_SHEET_RANGE=Recipients!A:C,DRY_RUN=false
 ```
 
-When `RECIPIENTS_SHEET_ID` is configured, Google Sheet becomes the recipient source. If it is empty, the service falls back to `CALLMEBOT_PHONE` + `CALLMEBOT_API_KEY` environment variables.
+When `RECIPIENTS_SHEET_ID` is present, Google Sheet recipients take precedence over the single-recipient `CALLMEBOT_PHONE` / `CALLMEBOT_API_KEY` fallback.
 
----
+## API endpoints
 
-# Google Cloud deployment / upgrade
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/` | Service summary |
+| GET | `/health` | Version, state backend and recipient mode |
+| GET | `/sources` | Check each official source independently |
+| POST | `/check` | Poll sources and conditionally notify |
+| POST | `/test-notification` | Send a test message to configured recipients |
 
-## Enable APIs
+Check source health:
 
 ```bash
-gcloud services enable \
-  run.googleapis.com \
-  cloudbuild.googleapis.com \
-  artifactregistry.googleapis.com \
-  firestore.googleapis.com \
-  cloudscheduler.googleapis.com \
-  sheets.googleapis.com
+curl "$SERVICE_URL/sources"
 ```
 
-## Cloud Build permission
+`events_found: 0` means the source was read successfully but no matching notification event is active.
 
-If source deployment reports that the default service account is missing permissions:
+## Google Cloud deployment / upgrade
 
-```bash
-gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="serviceAccount:$(gcloud builds get-default-service-account)" \
-  --role="roles/run.builder"
-```
-
-## Firestore
-
-Check first:
-
-```bash
-gcloud firestore databases list
-```
-
-If `(default)` does not exist:
-
-```bash
-gcloud firestore databases create --location=asia-east2 --type=firestore-native
-```
-
-Give the runtime service account Firestore access:
-
-```bash
-PROJECT_NUMBER=$(gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)')
-RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-
-gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="serviceAccount:${RUNTIME_SA}" \
-  --role="roles/datastore.user"
-```
-
-## First deployment
-
-```bash
-gcloud run deploy hk-weather-whatsapp-poc --source . --region asia-east2 --allow-unauthenticated --max-instances=1 --concurrency=1 --set-env-vars DRY_RUN=true,BOOTSTRAP_SILENT=true,STATE_BACKEND=firestore
-```
-
-## Upgrade an existing service
-
-Use `--update-env-vars`, not `--set-env-vars`, so existing CallMeBot credentials are not removed.
+Get the latest code:
 
 ```bash
 cd ~/hk-weather-whatsapp-poc
 git pull
+```
 
+Enable required APIs:
+
+```bash
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com cloudscheduler.googleapis.com sheets.googleapis.com
+```
+
+For an existing service, preserve current environment variables by using `--update-env-vars`:
+
+```bash
 gcloud run deploy hk-weather-whatsapp-poc \
   --source . \
   --region asia-east2 \
@@ -214,19 +202,14 @@ gcloud run deploy hk-weather-whatsapp-poc \
   --update-env-vars STATE_BACKEND=firestore,BOOTSTRAP_SILENT=true
 ```
 
-## Service URL
+Get the URL:
 
 ```bash
-SERVICE_URL=$(gcloud run services describe hk-weather-whatsapp-poc \
-  --region asia-east2 \
-  --format='value(status.url)')
-
+SERVICE_URL=$(gcloud run services describe hk-weather-whatsapp-poc --region asia-east2 --format='value(status.url)')
 echo "$SERVICE_URL"
 ```
 
-If `curl` reports `URL rejected: No host part in the URL`, `$SERVICE_URL` was not successfully set.
-
-## Verify v0.4.0
+Verify:
 
 ```bash
 curl "$SERVICE_URL/health"
@@ -234,39 +217,13 @@ curl "$SERVICE_URL/sources"
 curl -X POST "$SERVICE_URL/check"
 ```
 
-Expected `/health` includes:
+## Firestore safety
 
-```json
-{"status":"ok","version":"0.4.0","state_backend":"firestore"}
-```
-
-`/sources` shows each official source separately. `source_health=degraded` does not automatically stop healthy-source notifications.
-
-## Enable real notification
-
-Single-recipient fallback:
-
-```bash
-gcloud run services update hk-weather-whatsapp-poc \
-  --region asia-east2 \
-  --update-env-vars CALLMEBOT_PHONE=YOUR_PHONE,CALLMEBOT_API_KEY=YOUR_KEY,DRY_RUN=false
-```
-
-Google Sheet recipient mode:
-
-```bash
-gcloud run services update hk-weather-whatsapp-poc \
-  --region asia-east2 \
-  --update-env-vars RECIPIENTS_SHEET_ID=YOUR_SPREADSHEET_ID,RECIPIENTS_SHEET_RANGE=Recipients!A:F,DRY_RUN=false
-```
-
-Test manually:
-
-```bash
-curl -X POST "$SERVICE_URL/test-notification"
-```
+Firestore stores current and previously notified event state, so Cloud Run restart / scale-to-zero does not cause repeated alerts. A healthy source that no longer reports an event silently resets that event state, allowing a future new occurrence to notify again. A failed source does not reset its state.
 
 ## Cloud Scheduler
+
+Example every-minute job:
 
 ```bash
 gcloud scheduler jobs create http hk-weather-check \
@@ -277,27 +234,14 @@ gcloud scheduler jobs create http hk-weather-check \
   --http-method=POST
 ```
 
-If the job already exists, do not create it again.
+Every-minute polling does not mean every-minute WhatsApp messages.
 
----
+## Limitations
 
-# API endpoints
-
-| Method | Endpoint | Purpose |
-|---|---|---|
-| GET | `/` | Service info |
-| GET | `/health` | Version / state backend / recipient mode |
-| GET | `/sources` | Health of each official source |
-| POST | `/check` | Fetch sources and notify on a new actionable event |
-| POST | `/test-notification` | Manual WhatsApp test |
-
-## Current limitations
-
-- Recovery/cancellation messages are not sent yet; inactive state is reset silently.
-- CallMeBot is suitable for personal/small-team PoC use, not enterprise-scale broadcasting.
-- Each CallMeBot recipient must activate CallMeBot and supply their own API key.
-- Official wording may change; parsers should be reviewed during real severe-weather events.
+- Warning cancellation / recovery messages are currently reset silently rather than sent as separate `cleared` WhatsApp notifications.
+- CallMeBot is appropriate for a personal or small-team PoC, not large enterprise broadcasting.
+- Official wording can change, so parsing patterns should be validated during real severe-weather events.
 
 ## Disclaimer
 
-This service is a technical automation aid. During severe weather, official instructions from the HKSAR Government, Hong Kong Observatory, Education Bureau and the employer remain authoritative.
+This is a technical PoC. HKSAR Government, Hong Kong Observatory, Education Bureau and employer instructions remain authoritative during severe weather.
