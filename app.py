@@ -9,6 +9,7 @@ from typing import Any, Callable
 import feedparser
 import requests
 from fastapi import FastAPI, HTTPException
+from google.cloud import firestore
 
 HKT = timezone(timedelta(hours=8))
 
@@ -17,6 +18,19 @@ HKO_SWT_URL = "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataT
 EDB_RSS_URL = "https://www.edb.gov.hk/tc/whats_new_rss.xml"
 GOVHK_RSS_URL = "https://www.info.gov.hk/gia/rss/general_zh.xml"
 CALLMEBOT_URL = "https://api.callmebot.com/whatsapp.php"
+
+# Only these states are allowed to trigger WhatsApp. Informational states such as
+# T1, T3 and Amber Rain are still observed and stored, but they do not notify.
+NOTIFY_STATUSES = {
+    "PRE_T8",
+    "T8",
+    "T9",
+    "T10",
+    "RED_RAIN",
+    "BLACK_RAIN",
+    "EXTREME_CONDITIONS",
+    "SUSPENDED",
+}
 
 
 @dataclass(frozen=True)
@@ -49,22 +63,31 @@ class Settings:
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     bootstrap_silent = os.getenv("BOOTSTRAP_SILENT", "true").lower() == "true"
     rss_max_age_hours = int(os.getenv("RSS_MAX_AGE_HOURS", "12"))
-    state_path = Path(os.getenv("STATE_PATH", "/tmp/hk-weather-whatsapp-state.json"))
     request_timeout = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
+    state_backend = os.getenv(
+        "STATE_BACKEND",
+        "firestore" if os.getenv("K_SERVICE") else "local",
+    ).lower()
+    state_path = Path(os.getenv("STATE_PATH", "/tmp/hk-weather-whatsapp-state.json"))
+    firestore_collection = os.getenv("FIRESTORE_COLLECTION", "hk_weather_notification_state")
 
 
 settings = Settings()
-app = FastAPI(title="HK Weather & School WhatsApp PoC", version="0.2.0")
+app = FastAPI(title="HK Weather & School WhatsApp PoC", version="0.3.0")
+
+
+def now_hkt() -> str:
+    return datetime.now(HKT).isoformat()
 
 
 def fetch_json(url: str) -> Any:
-    r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": "hk-weather-whatsapp-poc/0.2"})
+    r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": "hk-weather-whatsapp-poc/0.3"})
     r.raise_for_status()
     return r.json()
 
 
 def fetch_text(url: str) -> str:
-    r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": "hk-weather-whatsapp-poc/0.2"})
+    r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": "hk-weather-whatsapp-poc/0.3"})
     r.raise_for_status()
     return r.text
 
@@ -109,7 +132,6 @@ def normalize_hko_warning_summary(data: dict[str, Any]) -> list[Event]:
         name = str(raw.get("name", ""))
         code = str(raw.get("code", ""))
         text = f"{name} {code}"
-
         typhoon = detect_typhoon_status(text)
         if typhoon:
             events.append(Event(
@@ -123,7 +145,6 @@ def normalize_hko_warning_summary(data: dict[str, Any]) -> list[Event]:
                 published_at=raw.get("updateTime") or raw.get("issueTime"),
             ))
             continue
-
         rain = detect_rain_status(text)
         if rain:
             events.append(Event(
@@ -151,14 +172,13 @@ def normalize_special_weather_tips(data: Any) -> list[Event]:
         texts.append(json.dumps(data, ensure_ascii=False))
     else:
         texts.append(str(data))
-
     combined = "\n".join(texts)
-    pre_t8_patterns = [
+    patterns = [
         r"預計.*(?:八號|8號).*信號",
         r"考慮.*(?:八號|8號).*信號",
         r"No\.\s*8.*(?:expected|consider)",
     ]
-    if any(re.search(p, combined, flags=re.I | re.S) for p in pre_t8_patterns):
+    if any(re.search(p, combined, flags=re.I | re.S) for p in patterns):
         return [Event(
             key="weather:pre_t8",
             event_type="TYPHOON_PRE_ALERT",
@@ -183,12 +203,10 @@ def recent_entries(feed_text: str) -> list[Any]:
     if getattr(parsed, "bozo", False) and not parsed.entries:
         raise ValueError(f"RSS parse failed: {getattr(parsed, 'bozo_exception', 'unknown error')}")
     cutoff = datetime.now(HKT) - timedelta(hours=settings.rss_max_age_hours)
-    output = []
-    for entry in parsed.entries:
-        published = parse_entry_time(entry)
-        if published is None or published >= cutoff:
-            output.append(entry)
-    return output
+    return [
+        entry for entry in parsed.entries
+        if (parse_entry_time(entry) is None or parse_entry_time(entry) >= cutoff)
+    ]
 
 
 def school_scope(text: str) -> str:
@@ -206,13 +224,12 @@ def school_scope(text: str) -> str:
 
 
 def normalize_edb(feed_text: str) -> list[Event]:
-    events = []
     for entry in recent_entries(feed_text):
         title = getattr(entry, "title", "")
         summary = getattr(entry, "summary", "")
         combined = f"{title} {summary}"
         if re.search(r"停課|classes? (?:are )?suspended|suspension of classes", combined, flags=re.I):
-            events.append(Event(
+            return [Event(
                 key="school:suspension",
                 event_type="SCHOOL_SUSPENSION",
                 status="SUSPENDED",
@@ -222,19 +239,17 @@ def normalize_edb(feed_text: str) -> list[Event]:
                 source_url=getattr(entry, "link", EDB_RSS_URL),
                 published_at=parse_entry_time(entry).isoformat() if parse_entry_time(entry) else None,
                 scope=school_scope(combined),
-            ))
-            break
-    return events
+            )]
+    return []
 
 
 def normalize_govhk(feed_text: str) -> list[Event]:
-    events = []
     for entry in recent_entries(feed_text):
         title = getattr(entry, "title", "")
         summary = getattr(entry, "summary", "")
         combined = f"{title} {summary}"
         if re.search(r"極端情況|Extreme Conditions", combined, flags=re.I):
-            events.append(Event(
+            return [Event(
                 key="government:extreme_conditions",
                 event_type="EXTREME_CONDITIONS",
                 status="EXTREME_CONDITIONS",
@@ -243,18 +258,12 @@ def normalize_govhk(feed_text: str) -> list[Event]:
                 source="香港政府新聞公報",
                 source_url=getattr(entry, "link", GOVHK_RSS_URL),
                 published_at=parse_entry_time(entry).isoformat() if parse_entry_time(entry) else None,
-            ))
-            break
-    return events
+            )]
+    return []
 
 
-def run_source_check(
-    name: str,
-    source: str,
-    url: str,
-    fn: Callable[[], list[Event]],
-) -> tuple[list[Event], SourceCheck]:
-    checked_at = datetime.now(HKT).isoformat()
+def run_source_check(name: str, source: str, url: str, fn: Callable[[], list[Event]]) -> tuple[list[Event], SourceCheck]:
+    checked_at = now_hkt()
     try:
         source_events = fn()
         return source_events, SourceCheck(
@@ -279,36 +288,69 @@ def run_source_check(
 
 
 def collect_events() -> tuple[list[Event], list[SourceCheck], list[str]]:
-    events: list[Event] = []
-    source_checks: list[SourceCheck] = []
     definitions = [
         ("hko_warning_summary", "香港天文台－警告摘要", HKO_WARNING_URL, lambda: normalize_hko_warning_summary(fetch_json(HKO_WARNING_URL))),
         ("hko_special_weather_tips", "香港天文台－特別天氣提示", HKO_SWT_URL, lambda: normalize_special_weather_tips(fetch_json(HKO_SWT_URL))),
         ("edb_latest_news", "香港教育局－最新消息", EDB_RSS_URL, lambda: normalize_edb(fetch_text(EDB_RSS_URL))),
         ("govhk_press_release", "香港政府新聞公報", GOVHK_RSS_URL, lambda: normalize_govhk(fetch_text(GOVHK_RSS_URL))),
     ]
-
+    events: list[Event] = []
+    checks: list[SourceCheck] = []
     for name, source, url, fn in definitions:
         source_events, check = run_source_check(name, source, url, fn)
         events.extend(source_events)
-        source_checks.append(check)
-
-    errors = [f"{check.source}: {check.detail}" for check in source_checks if not check.ok]
-    return events, source_checks, errors
-
-
-def load_state() -> dict[str, str]:
-    if not settings.state_path.exists():
-        return {}
-    try:
-        return json.loads(settings.state_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+        checks.append(check)
+    errors = [f"{c.source}: {c.detail}" for c in checks if not c.ok]
+    return events, checks, errors
 
 
-def save_state(state: dict[str, str]) -> None:
-    settings.state_path.parent.mkdir(parents=True, exist_ok=True)
-    settings.state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+class LocalStateStore:
+    def load(self) -> dict[str, dict[str, Any]]:
+        if not settings.state_path.exists():
+            return {}
+        try:
+            data = json.loads(settings.state_path.read_text(encoding="utf-8"))
+            # Backward compatibility with v0.2 {key: status} state.
+            return {
+                key: (value if isinstance(value, dict) else {"current_status": value, "last_notified_status": None})
+                for key, value in data.items()
+            }
+        except Exception:
+            return {}
+
+    def save_record(self, key: str, record: dict[str, Any]) -> None:
+        state = self.load()
+        state[key] = record
+        settings.state_path.parent.mkdir(parents=True, exist_ok=True)
+        settings.state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class FirestoreStateStore:
+    def __init__(self) -> None:
+        self.client = firestore.Client()
+        self.collection = self.client.collection(settings.firestore_collection)
+
+    def load(self) -> dict[str, dict[str, Any]]:
+        return {doc.id: (doc.to_dict() or {}) for doc in self.collection.stream()}
+
+    def save_record(self, key: str, record: dict[str, Any]) -> None:
+        self.collection.document(key.replace(":", "__")).set(record, merge=True)
+
+    def load(self) -> dict[str, dict[str, Any]]:  # type: ignore[override]
+        state: dict[str, dict[str, Any]] = {}
+        for doc in self.collection.stream():
+            data = doc.to_dict() or {}
+            original_key = data.get("event_key") or doc.id.replace("__", ":")
+            state[original_key] = data
+        return state
+
+
+def get_state_store() -> LocalStateStore | FirestoreStateStore:
+    if settings.state_backend == "firestore":
+        return FirestoreStateStore()
+    if settings.state_backend == "local":
+        return LocalStateStore()
+    raise RuntimeError(f"Unsupported STATE_BACKEND: {settings.state_backend}")
 
 
 def human_status(status: str | None) -> str | None:
@@ -350,30 +392,22 @@ def message_heading(event: Event) -> tuple[str, str]:
 def action_text(event: Event) -> str:
     if event.event_type == "SCHOOL_SUSPENSION":
         return "請家長及學生留意教育局的最新安排，並以官方公告為準。"
-    if event.status in {"T8", "T9", "T10", "BLACK_RAIN", "EXTREME_CONDITIONS"}:
+    if event.status in {"T8", "T9", "T10", "BLACK_RAIN"}:
         return "請避免不必要外出，留意交通及安全情況；工作安排請依公司內部惡劣天氣政策執行。"
     if event.status in {"PRE_T8", "RED_RAIN"}:
-        return "請提前留意交通及天氣變化，並準備依公司內部惡劣天氣政策調整安排。"
-    if event.event_type == "TEST":
-        return "這是一則測試訊息，代表 Cloud Run → CallMeBot → WhatsApp 通知鏈路運作正常。"
-    return "請持續留意香港天文台及相關政府部門的最新公告。"
+        return "請提前留意交通、天氣及公司工作安排，並持續查看官方最新消息。"
+    if event.status == "EXTREME_CONDITIONS":
+        return "請留意政府最新安排，並依公司內部政策執行。"
+    return "請留意官方最新消息。"
 
 
 def format_message(event: Event, previous: str | None) -> str:
     icon, heading = message_heading(event)
-    lines = [
-        f"{icon} *{heading}*",
-        "",
-        event.title,
-    ]
-
-    if event.event_type != "TEST":
-        lines.append(f"目前狀況：{human_status(event.status)}")
+    lines = [f"{icon} *{heading}*", "", event.title, f"目前狀況：{human_status(event.status)}"]
     if event.scope:
         lines.append(f"適用範圍：{event.scope}")
-    if previous and previous != event.status:
+    if previous:
         lines.append(f"前一狀況：{human_status(previous)}")
-
     lines.extend([
         "",
         f"📌 {action_text(event)}",
@@ -401,48 +435,146 @@ def send_whatsapp(message: str) -> dict[str, Any]:
 
 def process_once() -> dict[str, Any]:
     events, source_checks, errors = collect_events()
-    previous_state = load_state()
-    first_run = not bool(previous_state)
-    next_state = dict(previous_state)
+
+    # Fail closed: if any official source is unavailable, do not update state and
+    # do not send WhatsApp. This prevents partial data from creating false changes.
+    if errors:
+        return {
+            "checked_at": now_hkt(),
+            "source_health": "degraded",
+            "sources": [asdict(c) for c in source_checks],
+            "events": [asdict(e) for e in events],
+            "notifications": [],
+            "errors": errors,
+            "dry_run": settings.dry_run,
+            "state_backend": settings.state_backend,
+            "decision": "fail_closed_no_notification",
+        }
+
+    try:
+        store = get_state_store()
+        previous_state = store.load()
+    except Exception as exc:
+        # State store is safety-critical. If it cannot be read, never notify.
+        return {
+            "checked_at": now_hkt(),
+            "source_health": "ok",
+            "sources": [asdict(c) for c in source_checks],
+            "events": [asdict(e) for e in events],
+            "notifications": [],
+            "errors": [f"State store unavailable: {type(exc).__name__}: {exc}"],
+            "dry_run": settings.dry_run,
+            "state_backend": settings.state_backend,
+            "decision": "fail_closed_no_notification",
+        }
+
     notifications = []
-
     for event in events:
-        previous = previous_state.get(event.key)
-        next_state[event.key] = event.status
-        changed = previous != event.status
-        if not changed:
-            continue
-        if first_run and settings.bootstrap_silent:
-            notifications.append({"event": asdict(event), "action": "bootstrap_only"})
-            continue
-        result = send_whatsapp(format_message(event, previous))
-        notifications.append({"event": asdict(event), "action": "notify", "result": result})
+        previous_record = previous_state.get(event.key, {})
+        previous_status = previous_record.get("current_status")
+        last_notified_status = previous_record.get("last_notified_status")
+        first_seen = not previous_record
+        changed = previous_status != event.status
+        should_notify = (
+            changed
+            and event.status in NOTIFY_STATUSES
+            and last_notified_status != event.status
+            and not (first_seen and settings.bootstrap_silent)
+        )
 
-    save_state(next_state)
-    all_sources_ok = all(check.ok for check in source_checks)
+        record = {
+            "event_key": event.key,
+            "current_status": event.status,
+            "last_notified_status": last_notified_status,
+            "source": event.source,
+            "updated_at": now_hkt(),
+        }
+
+        action = "state_only"
+        result: dict[str, Any] | None = None
+        if should_notify:
+            try:
+                result = send_whatsapp(format_message(event, previous_status))
+                # In dry-run we intentionally do not mark the status as notified.
+                if result.get("sent") is True:
+                    record["last_notified_status"] = event.status
+                action = "notify" if result.get("sent") else "dry_run_preview"
+            except Exception as exc:
+                action = "notification_failed"
+                result = {"sent": False, "error": f"{type(exc).__name__}: {exc}"}
+        elif first_seen and settings.bootstrap_silent:
+            action = "bootstrap_only"
+        elif event.status not in NOTIFY_STATUSES:
+            action = "informational_state_only"
+        elif not changed:
+            action = "no_change"
+        elif last_notified_status == event.status:
+            action = "already_notified"
+
+        # Save the observed state even if notification delivery failed; because
+        # last_notified_status remains unchanged, a subsequent run can retry.
+        try:
+            store.save_record(event.key, record)
+        except Exception as exc:
+            return {
+                "checked_at": now_hkt(),
+                "source_health": "ok",
+                "sources": [asdict(c) for c in source_checks],
+                "events": [asdict(e) for e in events],
+                "notifications": notifications,
+                "errors": [f"State save failed: {type(exc).__name__}: {exc}"],
+                "dry_run": settings.dry_run,
+                "state_backend": settings.state_backend,
+                "decision": "state_write_failed",
+            }
+
+        if action not in {"no_change", "state_only"}:
+            notifications.append({
+                "event": asdict(event),
+                "action": action,
+                "previous_status": previous_status,
+                "result": result,
+            })
+
     return {
-        "checked_at": datetime.now(HKT).isoformat(),
-        "source_health": "ok" if all_sources_ok else "degraded",
-        "sources": [asdict(check) for check in source_checks],
+        "checked_at": now_hkt(),
+        "source_health": "ok",
+        "sources": [asdict(c) for c in source_checks],
         "events": [asdict(e) for e in events],
         "notifications": notifications,
-        "errors": errors,
+        "errors": [],
         "dry_run": settings.dry_run,
+        "state_backend": settings.state_backend,
+        "decision": "completed",
+    }
+
+
+@app.get("/")
+def root() -> dict[str, str]:
+    return {
+        "service": "HK Weather & School WhatsApp Notification PoC",
+        "version": "0.3.0",
+        "docs": "/docs",
+        "health": "/health",
+        "sources": "/sources",
     }
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "version": "0.2.0"}
+def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "version": "0.3.0",
+        "state_backend": settings.state_backend,
+    }
 
 
 @app.get("/sources")
 def sources() -> dict[str, Any]:
-    _, source_checks, errors = collect_events()
+    _, checks, errors = collect_events()
     return {
-        "checked_at": datetime.now(HKT).isoformat(),
-        "source_health": "ok" if all(check.ok for check in source_checks) else "degraded",
-        "sources": [asdict(check) for check in source_checks],
+        "source_health": "ok" if not errors else "degraded",
+        "sources": [asdict(c) for c in checks],
         "errors": errors,
     }
 
@@ -459,9 +591,9 @@ def test_notification() -> dict[str, Any]:
         event_type="TEST",
         status="TEST",
         level="INFO",
-        title="香港惡劣天氣通知服務已成功連線。",
-        source="HK Weather WhatsApp PoC",
-        source_url="https://github.com/chienchitung/hk-weather-whatsapp-poc",
+        title="香港惡劣天氣監控服務已成功連線。",
+        source="系統測試",
+        source_url="https://www.gov.hk/tc/about/rss.htm",
     )
     try:
         return send_whatsapp(format_message(event, None))
