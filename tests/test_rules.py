@@ -1,4 +1,11 @@
-from app import detect_rain_status, detect_typhoon_status, level_for, normalize_edb, normalize_hko_warning_summary
+from app import (
+    NOTIFY_STATUSES,
+    detect_rain_status,
+    detect_typhoon_status,
+    level_for,
+    normalize_edb,
+    normalize_hko_warning_summary,
+)
 
 
 def test_detect_typhoon_status():
@@ -14,9 +21,16 @@ def test_detect_rain_status():
 
 
 def test_level_mapping():
-    assert level_for("TYPHOON", "T8") == "ACTION_REQUIRED"
-    assert level_for("RAINSTORM", "RED_RAIN") == "PREPARE"
-    assert level_for("TYPHOON", "T3") == "INFO"
+    assert level_for("T8") == "ACTION_REQUIRED"
+    assert level_for("RED_RAIN") == "PREPARE"
+    assert level_for("T3") == "INFO"
+
+
+def test_notification_whitelist():
+    for status in {"PRE_T8", "T8", "T9", "T10", "RED_RAIN", "BLACK_RAIN", "EXTREME_CONDITIONS", "SUSPENDED"}:
+        assert status in NOTIFY_STATUSES
+    for status in {"T1", "T3", "AMBER_RAIN"}:
+        assert status not in NOTIFY_STATUSES
 
 
 def test_normalize_hko_warning_summary():
@@ -33,11 +47,18 @@ def test_normalize_hko_warning_summary():
             "actionCode": "ISSUE",
             "issueTime": "2026-08-24T10:05:00+08:00",
         },
+        "WHOT": {
+            "name": "酷熱天氣警告",
+            "code": "WHOT",
+            "actionCode": "ISSUE",
+            "issueTime": "2026-08-24T10:45:00+08:00",
+        },
     }
     events = normalize_hko_warning_summary(fixture)
     by_key = {e.key: e for e in events}
     assert by_key["weather:typhoon"].status == "T8"
     assert by_key["weather:rainstorm"].status == "RED_RAIN"
+    assert all(e.status != "WHOT" for e in events)
 
 
 def test_normalize_edb_school_suspension():
