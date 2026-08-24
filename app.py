@@ -18,9 +18,10 @@ HKO_SWT_URL = "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataT
 EDB_RSS_URL = "https://www.edb.gov.hk/tc/whats_new_rss.xml"
 GOVHK_RSS_URL = "https://www.info.gov.hk/gia/rss/general_zh.xml"
 CALLMEBOT_URL = "https://api.callmebot.com/whatsapp.php"
+META_KEY = "__meta__"
 
-# Only these states are allowed to trigger WhatsApp. Informational states such as
-# T1, T3 and Amber Rain are still observed and stored, but they do not notify.
+# Only actionable states are allowed to trigger WhatsApp. T1, T3 and Amber Rain
+# remain useful context and are stored, but never notify by themselves.
 NOTIFY_STATUSES = {
     "PRE_T8",
     "T8",
@@ -73,7 +74,7 @@ class Settings:
 
 
 settings = Settings()
-app = FastAPI(title="HK Weather & School WhatsApp PoC", version="0.3.0")
+app = FastAPI(title="HK Weather & School WhatsApp PoC", version="0.3.1")
 
 
 def now_hkt() -> str:
@@ -203,10 +204,12 @@ def recent_entries(feed_text: str) -> list[Any]:
     if getattr(parsed, "bozo", False) and not parsed.entries:
         raise ValueError(f"RSS parse failed: {getattr(parsed, 'bozo_exception', 'unknown error')}")
     cutoff = datetime.now(HKT) - timedelta(hours=settings.rss_max_age_hours)
-    return [
-        entry for entry in parsed.entries
-        if (parse_entry_time(entry) is None or parse_entry_time(entry) >= cutoff)
-    ]
+    output = []
+    for entry in parsed.entries:
+        published = parse_entry_time(entry)
+        if published is None or published >= cutoff:
+            output.append(entry)
+    return output
 
 
 def school_scope(text: str) -> str:
@@ -310,7 +313,6 @@ class LocalStateStore:
             return {}
         try:
             data = json.loads(settings.state_path.read_text(encoding="utf-8"))
-            # Backward compatibility with v0.2 {key: status} state.
             return {
                 key: (value if isinstance(value, dict) else {"current_status": value, "last_notified_status": None})
                 for key, value in data.items()
@@ -331,18 +333,16 @@ class FirestoreStateStore:
         self.collection = self.client.collection(settings.firestore_collection)
 
     def load(self) -> dict[str, dict[str, Any]]:
-        return {doc.id: (doc.to_dict() or {}) for doc in self.collection.stream()}
-
-    def save_record(self, key: str, record: dict[str, Any]) -> None:
-        self.collection.document(key.replace(":", "__")).set(record, merge=True)
-
-    def load(self) -> dict[str, dict[str, Any]]:  # type: ignore[override]
         state: dict[str, dict[str, Any]] = {}
         for doc in self.collection.stream():
             data = doc.to_dict() or {}
             original_key = data.get("event_key") or doc.id.replace("__", ":")
             state[original_key] = data
         return state
+
+    def save_record(self, key: str, record: dict[str, Any]) -> None:
+        doc_id = "meta" if key == META_KEY else key.replace(":", "__")
+        self.collection.document(doc_id).set(record, merge=True)
 
 
 def get_state_store() -> LocalStateStore | FirestoreStateStore:
@@ -433,39 +433,73 @@ def send_whatsapp(message: str) -> dict[str, Any]:
     return {"sent": True, "status_code": r.status_code, "response": r.text[:500]}
 
 
+def fail_closed_payload(source_checks: list[SourceCheck], events: list[Event], errors: list[str], decision: str) -> dict[str, Any]:
+    return {
+        "checked_at": now_hkt(),
+        "source_health": "ok" if not errors else "degraded",
+        "sources": [asdict(c) for c in source_checks],
+        "events": [asdict(e) for e in events],
+        "notifications": [],
+        "errors": errors,
+        "dry_run": settings.dry_run,
+        "state_backend": settings.state_backend,
+        "decision": decision,
+    }
+
+
 def process_once() -> dict[str, Any]:
     events, source_checks, errors = collect_events()
 
-    # Fail closed: if any official source is unavailable, do not update state and
-    # do not send WhatsApp. This prevents partial data from creating false changes.
+    # Safety rule 1: partial official data must never trigger a notification.
     if errors:
-        return {
-            "checked_at": now_hkt(),
-            "source_health": "degraded",
-            "sources": [asdict(c) for c in source_checks],
-            "events": [asdict(e) for e in events],
-            "notifications": [],
-            "errors": errors,
-            "dry_run": settings.dry_run,
-            "state_backend": settings.state_backend,
-            "decision": "fail_closed_no_notification",
-        }
+        return fail_closed_payload(source_checks, events, errors, "fail_closed_source_error")
 
     try:
         store = get_state_store()
         previous_state = store.load()
     except Exception as exc:
-        # State store is safety-critical. If it cannot be read, never notify.
+        return fail_closed_payload(
+            source_checks,
+            events,
+            [f"State store unavailable: {type(exc).__name__}: {exc}"],
+            "fail_closed_state_error",
+        )
+
+    # Persist a global bootstrap marker. This is important when deployment occurs
+    # on a quiet day with zero active events: a later first real T8 must notify.
+    bootstrap_complete = bool(previous_state.get(META_KEY, {}).get("bootstrap_complete"))
+    if not bootstrap_complete:
+        try:
+            for event in events:
+                store.save_record(event.key, {
+                    "event_key": event.key,
+                    "current_status": event.status,
+                    "last_notified_status": None,
+                    "source": event.source,
+                    "updated_at": now_hkt(),
+                })
+            store.save_record(META_KEY, {
+                "event_key": META_KEY,
+                "bootstrap_complete": True,
+                "completed_at": now_hkt(),
+            })
+        except Exception as exc:
+            return fail_closed_payload(
+                source_checks,
+                events,
+                [f"Bootstrap state save failed: {type(exc).__name__}: {exc}"],
+                "fail_closed_bootstrap_error",
+            )
         return {
             "checked_at": now_hkt(),
             "source_health": "ok",
             "sources": [asdict(c) for c in source_checks],
             "events": [asdict(e) for e in events],
             "notifications": [],
-            "errors": [f"State store unavailable: {type(exc).__name__}: {exc}"],
+            "errors": [],
             "dry_run": settings.dry_run,
             "state_backend": settings.state_backend,
-            "decision": "fail_closed_no_notification",
+            "decision": "bootstrap_completed_no_notification",
         }
 
     notifications = []
@@ -473,13 +507,11 @@ def process_once() -> dict[str, Any]:
         previous_record = previous_state.get(event.key, {})
         previous_status = previous_record.get("current_status")
         last_notified_status = previous_record.get("last_notified_status")
-        first_seen = not previous_record
         changed = previous_status != event.status
         should_notify = (
             changed
             and event.status in NOTIFY_STATUSES
             and last_notified_status != event.status
-            and not (first_seen and settings.bootstrap_silent)
         )
 
         record = {
@@ -490,45 +522,33 @@ def process_once() -> dict[str, Any]:
             "updated_at": now_hkt(),
         }
 
-        action = "state_only"
+        action = "no_change"
         result: dict[str, Any] | None = None
         if should_notify:
             try:
                 result = send_whatsapp(format_message(event, previous_status))
-                # In dry-run we intentionally do not mark the status as notified.
                 if result.get("sent") is True:
                     record["last_notified_status"] = event.status
                 action = "notify" if result.get("sent") else "dry_run_preview"
             except Exception as exc:
                 action = "notification_failed"
                 result = {"sent": False, "error": f"{type(exc).__name__}: {exc}"}
-        elif first_seen and settings.bootstrap_silent:
-            action = "bootstrap_only"
         elif event.status not in NOTIFY_STATUSES:
             action = "informational_state_only"
-        elif not changed:
-            action = "no_change"
         elif last_notified_status == event.status:
             action = "already_notified"
 
-        # Save the observed state even if notification delivery failed; because
-        # last_notified_status remains unchanged, a subsequent run can retry.
         try:
             store.save_record(event.key, record)
         except Exception as exc:
-            return {
-                "checked_at": now_hkt(),
-                "source_health": "ok",
-                "sources": [asdict(c) for c in source_checks],
-                "events": [asdict(e) for e in events],
-                "notifications": notifications,
-                "errors": [f"State save failed: {type(exc).__name__}: {exc}"],
-                "dry_run": settings.dry_run,
-                "state_backend": settings.state_backend,
-                "decision": "state_write_failed",
-            }
+            return fail_closed_payload(
+                source_checks,
+                events,
+                [f"State save failed: {type(exc).__name__}: {exc}"],
+                "state_write_failed",
+            )
 
-        if action not in {"no_change", "state_only"}:
+        if action != "no_change":
             notifications.append({
                 "event": asdict(event),
                 "action": action,
@@ -553,7 +573,7 @@ def process_once() -> dict[str, Any]:
 def root() -> dict[str, str]:
     return {
         "service": "HK Weather & School WhatsApp Notification PoC",
-        "version": "0.3.0",
+        "version": "0.3.1",
         "docs": "/docs",
         "health": "/health",
         "sources": "/sources",
@@ -564,7 +584,7 @@ def root() -> dict[str, str]:
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "version": "0.3.0",
+        "version": "0.3.1",
         "state_backend": settings.state_backend,
     }
 
