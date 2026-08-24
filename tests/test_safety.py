@@ -1,3 +1,5 @@
+import json
+
 from app import Event, NOTIFY_STATUSES, process_once, settings
 
 
@@ -23,6 +25,7 @@ def test_quiet_bootstrap_does_not_suppress_first_real_event(monkeypatch, tmp_pat
 
     event = Event(
         key="weather:typhoon",
+        source_id="hko_warning_summary",
         event_type="TYPHOON",
         status="T8",
         level="ACTION_REQUIRED",
@@ -38,11 +41,48 @@ def test_quiet_bootstrap_does_not_suppress_first_real_event(monkeypatch, tmp_pat
     assert second["notifications"][0]["event"]["status"] == "T8"
 
 
-def test_source_error_fails_closed(monkeypatch):
+def test_one_source_error_does_not_block_other_valid_event(monkeypatch, tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "__meta__": {
+                    "event_key": "__meta__",
+                    "bootstrap_complete": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(settings, "state_backend", "local")
+    monkeypatch.setattr(settings, "state_path", state_path)
+    monkeypatch.setattr(settings, "dry_run", True)
+
+    event = Event(
+        key="weather:typhoon",
+        source_id="hko_warning_summary",
+        event_type="TYPHOON",
+        status="T8",
+        level="ACTION_REQUIRED",
+        title="八號烈風或暴風信號",
+        source="香港天文台",
+        source_url="https://example.com",
+    )
+
     monkeypatch.setattr(
         "app.collect_events",
-        lambda: ([], [], ["香港天文台－警告摘要: timeout"]),
+        lambda: (
+            [event],
+            [],
+            ["香港教育局－最新消息: timeout"],
+        ),
     )
+
     result = process_once()
-    assert result["decision"] == "fail_closed_source_error"
-    assert result["notifications"] == []
+
+    assert result["decision"] == "completed_with_source_or_state_warnings"
+    assert len(result["notifications"]) == 1
+    assert result["notifications"][0]["action"] == "dry_run_preview"
+    assert result["notifications"][0]["event"]["status"] == "T8"
+    assert result["errors"] == ["香港教育局－最新消息: timeout"]
