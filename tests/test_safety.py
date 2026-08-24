@@ -3,6 +3,15 @@ import json
 from app import Event, NOTIFY_STATUSES, process_once, settings
 
 
+def configure_local_dry_run(monkeypatch, state_path):
+    monkeypatch.setattr(settings, "state_backend", "local")
+    monkeypatch.setattr(settings, "state_path", state_path)
+    monkeypatch.setattr(settings, "dry_run", True)
+    monkeypatch.setattr(settings, "recipients_sheet_id", "")
+    monkeypatch.setattr(settings, "phone", "85200000000")
+    monkeypatch.setattr(settings, "api_key", "test-key")
+
+
 def test_informational_states_not_in_notification_whitelist():
     assert "T1" not in NOTIFY_STATUSES
     assert "T3" not in NOTIFY_STATUSES
@@ -14,9 +23,7 @@ def test_informational_states_not_in_notification_whitelist():
 
 def test_quiet_bootstrap_does_not_suppress_first_real_event(monkeypatch, tmp_path):
     state_path = tmp_path / "state.json"
-    monkeypatch.setattr(settings, "state_backend", "local")
-    monkeypatch.setattr(settings, "state_path", state_path)
-    monkeypatch.setattr(settings, "dry_run", True)
+    configure_local_dry_run(monkeypatch, state_path)
 
     monkeypatch.setattr("app.collect_events", lambda: ([], [], []))
     first = process_once()
@@ -54,10 +61,7 @@ def test_one_source_error_does_not_block_other_valid_event(monkeypatch, tmp_path
         ),
         encoding="utf-8",
     )
-
-    monkeypatch.setattr(settings, "state_backend", "local")
-    monkeypatch.setattr(settings, "state_path", state_path)
-    monkeypatch.setattr(settings, "dry_run", True)
+    configure_local_dry_run(monkeypatch, state_path)
 
     event = Event(
         key="weather:typhoon",
