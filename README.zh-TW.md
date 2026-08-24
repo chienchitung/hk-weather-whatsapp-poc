@@ -7,198 +7,166 @@
 ## 系統架構
 
 ```text
-Cloud Scheduler（每分鐘）
-        ↓
+Cloud Scheduler
+      ↓ 每分鐘
 Cloud Run /check
-        ↓
+      ↓
 官方來源彼此獨立檢查
-        ├─ 香港天文台警告摘要
-        ├─ 香港天文台特別天氣提示
-        ├─ 香港教育局 RSS
-        └─ 香港政府新聞公報 RSS
-        ↓
-Firestore 永久狀態 + 去重
-        ↓
+      ├─ 香港天文台警告摘要
+      ├─ 香港天文台特別天氣提示
+      ├─ 香港教育局 RSS
+      └─ 香港政府新聞公報 RSS
+      ↓
+Firestore 狀態與去重
+      ↓
 只有新的重要事件
-        ↓
-收件人
-        ├─ Google Sheet（多人）
-        └─ 環境變數（單人 fallback）
-        ↓
+      ↓
+Google Sheet 收件人
+      ↓
 CallMeBot → WhatsApp
 ```
 
-## 官方來源
+某一個官方來源失敗，不會阻擋其他健康來源的有效事件通知；失敗來源只會保留原本狀態，等來源恢復後再重新判斷。
 
-| 官方來源 | 用途 |
-|---|---|
-| 香港天文台 `warnsum` | 熱帶氣旋與暴雨警告狀態 |
-| 香港天文台 `swt` | Pre-No. 8／特別天氣提示 |
-| 香港教育局 RSS | 正式停課公告 |
-| 香港政府新聞公報 RSS | 極端情況與政府特別公告 |
+## 哪些狀態會通知？
 
-上述香港政府來源都不需要 API Key。
-
-## 什麼狀態會通知？
-
-Cloud Scheduler 可以每分鐘呼叫 `/check`，但 **不代表每分鐘都發 WhatsApp**。只有偵測到「新的、需要通知的狀態」，而且該狀態之前尚未成功通知過，才會呼叫 CallMeBot。
-
-| 官方狀態／訊息 | 系統狀態 | 會發 WhatsApp？ | 說明 |
-|---|---|---:|---|
-| 一號戒備信號 | `T1` | 否 | 只記錄作為前一狀態 |
-| 三號強風信號 | `T3` | 否 | 只記錄作為前一狀態 |
-| 天文台預告可能發出八號信號 | `PRE_T8` | **是** | 來自 HKO Special Weather Tips |
-| 八號烈風或暴風信號 | `T8` | **是** | 重要通知 |
-| 九號烈風或暴風風力增強信號 | `T9` | **是** | 重要通知 |
-| 十號颶風信號 | `T10` | **是** | 重要通知 |
-| 黃色暴雨警告 | `AMBER_RAIN` | 否 | 只記錄，不主動通知 |
-| 紅色暴雨警告 | `RED_RAIN` | **是** | 重要通知 |
-| 黑色暴雨警告 | `BLACK_RAIN` | **是** | 重要通知 |
-| 極端情況 | `EXTREME_CONDITIONS` | **是** | 政府特別安排 |
-| 教育局正式停課 | `SUSPENDED` | **是** | 正式停課公告 |
-| 酷熱天氣警告 `WHOT` | 不轉成通知事件 | 否 | HKO 來源仍會正常讀取，但目前不在停班／停課通知範圍 |
-| 寒冷天氣、雷暴、強烈季候風等其他 HKO 警告 | 不轉成通知事件 | 否 | 目前不在通知範圍 |
-
-例如：
-
-```text
-10:30 T3        → 記錄，不通知
-11:00 Pre-T8    → WhatsApp 通知一次
-11:01 Pre-T8    → 不重複
-12:00 T8        → WhatsApp 通知一次
-12:01 T8        → 不重複
-```
-
-## 某一個官方來源失敗時怎麼處理？
-
-各來源彼此獨立，不會因為其中一個來源失敗，就阻擋其他正常來源的有效通知。
-
-例如：
-
-```text
-教育局 RSS 暫時失敗
-香港天文台正常偵測到新的 T8
-→ T8 仍然會照常通知 CallMeBot
-```
-
-失敗的來源會保留先前狀態，不會因為暫時抓不到就被誤判成「事件解除」。等該來源恢復正常後再重新判斷。
-
-## 真人閱讀的通知格式
-
-```text
-🔴 香港天氣警報｜八號烈風或暴風信號已生效
-
-八號東南烈風或暴風信號
-目前狀況：八號烈風或暴風信號
-前一狀況：三號強風信號
-
-📌 請避免不必要外出，留意交通及安全情況；工作安排請依公司內部惡劣天氣政策執行。
-
-發布單位：香港天文台
-更新時間：2026-08-24 16:10 HKT
-官方公告：https://...
-```
-
-## Google Sheet 多人收件人
-
-如果是少量多人使用，Google Sheet 就是給非技術使用者維護的收件人清單。
-
-請建立一個工作表 tab，名稱必須是：
-
-```text
-Recipients
-```
-
-只保留這三欄：
-
-| name | phone | api_key |
+| 官方狀態 | 系統狀態 | WhatsApp |
 |---|---|---|
-| Jackie | 8869XXXXXXXX | XXXXXXX |
-| Amy | 8529XXXXXXX | XXXXXXX |
+| 一號戒備信號 | `T1` | 不通知 |
+| 三號強風信號 | `T3` | 不通知 |
+| 預告可能發出八號 | `PRE_T8` | **通知** |
+| 八號風球 | `T8` | **通知** |
+| 九號風球 | `T9` | **通知** |
+| 十號風球 | `T10` | **通知** |
+| 黃色暴雨 | `AMBER_RAIN` | 不通知 |
+| 紅色暴雨 | `RED_RAIN` | **通知** |
+| 黑色暴雨 | `BLACK_RAIN` | **通知** |
+| 極端情況 | `EXTREME_CONDITIONS` | **通知** |
+| 教育局停課 | `SUSPENDED` | **通知** |
+| 酷熱天氣警告 `WHOT` | 不轉成事件 | 不通知 |
+| 寒冷／雷暴／季候風等其他警告 | 不轉成事件 | 不通知 |
 
-規則：
+Cloud Scheduler 可以每分鐘呼叫 `/check`，但只有「新的、在通知白名單內、而且尚未通知過」的狀態才會呼叫 CallMeBot。
 
-- 只要一列同時有 `phone` 與 `api_key`，就視為啟用。
-- 新增收件人：新增一列。
-- 停止某人收件：直接刪掉該列。
-- 每一位收件人都必須各自完成 CallMeBot 啟用，並使用自己的 API key。
-- 因為 Sheet 中有 API key，請限制 Sheet 的分享權限，不要設成公開連結可存取。
+## Google Sheet 收件人
 
-目前使用的 Google Sheet ID：
+`Recipients` 工作表只需要三欄：
 
 ```text
-1IA5MgL130nSUvhCan2NIhIv7bpxZU1hNK4AChUjMEBI
+name | phone | api_key
 ```
 
-使用範圍：
+例如：
 
 ```text
-Recipients!A:C
+Jackie | 8869XXXXXXXX | XXXXXXX
+Amy    | 8529XXXXXXX  | XXXXXXX
 ```
 
-### 讓 Cloud Run 自動讀這張 Sheet
+只要一列同時有 `phone` 與 `api_key`，就視為有效收件人。新增使用者就新增一列；移除使用者就刪掉該列。
 
-先找出 Cloud Run runtime service account：
+目前設定：
+
+```text
+RECIPIENTS_SHEET_ID=1IA5MgL130nSUvhCan2NIhIv7bpxZU1hNK4AChUjMEBI
+RECIPIENTS_SHEET_RANGE=Recipients!A:C
+```
+
+Google Sheet 必須以「檢視者」分享給 Cloud Run runtime service account。
+
+## v0.4.1：新人單獨測試通知
+
+新增一個人到 Sheet 後，不需要等待真的 T8 或停課事件才知道設定是否成功。
+
+只測某一位：
 
 ```bash
-PROJECT_NUMBER=$(gcloud projects describe hk-weather-whatsapp-poc --format='value(projectNumber)')
-echo "${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+curl -X POST "$SERVICE_URL/test-recipient?name=Amy"
 ```
 
-把輸出的 service account email 加到 Google Sheet 的「共用」名單，權限只需要 **檢視者 Viewer**。
+這個 endpoint 只會傳給 Amy，不會傳給其他人。對方收到的內容會清楚標示為「設定測試」，不是正式惡劣天氣警告。
 
-這樣 Cloud Run 之後就能自己讀取 Sheet，不需要你的個人 Google 帳號保持登入。
+成功後，Firestore 會在以下 collection 保存驗證紀錄：
 
-啟用 Sheets API：
+```text
+hk_weather_recipient_status
+```
+
+例如：
+
+```text
+name: Amy
+verified: true
+last_test_status: success
+last_test_at: 2026-08-24...
+```
+
+如果 CallMeBot 尚未正常授權或傳送失敗，會記錄：
+
+```text
+verified: false
+last_test_status: failed
+```
+
+**verified 只是管理用狀態，不是正式通知的阻擋條件。** 只要使用者仍存在 Google Sheet，真的出現 T8、黑雨、停課等事件時，`/check` 還是會嘗試傳送。
+
+### 查看所有收件人的驗證狀態
 
 ```bash
-gcloud services enable sheets.googleapis.com
+curl "$SERVICE_URL/recipients"
 ```
 
-再設定 Cloud Run：
+範例：
 
-```bash
-gcloud run services update hk-weather-whatsapp-poc \
-  --region asia-east2 \
-  --update-env-vars RECIPIENTS_SHEET_ID=1IA5MgL130nSUvhCan2NIhIv7bpxZU1hNK4AChUjMEBI,RECIPIENTS_SHEET_RANGE=Recipients!A:C,DRY_RUN=false
+```json
+{
+  "total": 3,
+  "verified": 2,
+  "unverified": 1,
+  "recipients": [
+    {"name":"Jackie","verified":true,"last_test_status":"success"},
+    {"name":"Amy","verified":true,"last_test_status":"success"},
+    {"name":"Peter","verified":false,"last_test_status":null}
+  ]
+}
 ```
 
-只要設定了 `RECIPIENTS_SHEET_ID`，系統就會優先使用 Google Sheet 收件人，不再以單一 `CALLMEBOT_PHONE` / `CALLMEBOT_API_KEY` 作為主要收件人來源。
+這個 endpoint 不會回傳 phone 或 api_key。
+
+`POST /test-notification` 則保留為「一次測試 Sheet 裡所有收件人」。
 
 ## API 端點
 
 | Method | Endpoint | 用途 |
 |---|---|---|
-| GET | `/` | 服務基本資訊 |
-| GET | `/health` | 版本、state backend、recipient mode |
-| GET | `/sources` | 個別確認各官方來源是否成功 |
+| GET | `/` | 服務資訊 |
+| GET | `/health` | 版本、state backend、收件人模式 |
+| GET | `/sources` | 個別確認所有官方來源 |
+| GET | `/recipients` | 查看收件人驗證狀態 |
 | POST | `/check` | 正式檢查並依規則決定是否通知 |
-| POST | `/test-notification` | 測試目前設定的收件人 |
+| POST | `/test-notification` | 測試全部收件人 |
+| POST | `/test-recipient?name=...` | 只測一位收件人 |
 
-確認來源：
-
-```bash
-curl "$SERVICE_URL/sources"
-```
-
-`events_found: 0` 表示來源讀取成功，只是目前沒有符合通知條件的事件，不代表來源失敗。
-
-## Google Cloud 部署／升級
-
-取得最新程式：
+## 升級到 v0.4.1
 
 ```bash
 cd ~/hk-weather-whatsapp-poc
 git pull
 ```
 
-啟用必要 API：
+確認：
 
 ```bash
-gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com firestore.googleapis.com cloudscheduler.googleapis.com sheets.googleapis.com
+grep 'version=' app.py
 ```
 
-既有 Cloud Run 服務請使用 `--update-env-vars`，避免清掉原本環境變數：
+應看到：
+
+```text
+version="0.4.1"
+```
+
+重新部署既有 Cloud Run service：
 
 ```bash
 gcloud run deploy hk-weather-whatsapp-poc \
@@ -207,14 +175,15 @@ gcloud run deploy hk-weather-whatsapp-poc \
   --allow-unauthenticated \
   --max-instances=1 \
   --concurrency=1 \
-  --update-env-vars STATE_BACKEND=firestore,BOOTSTRAP_SILENT=true
+  --update-env-vars 'STATE_BACKEND=firestore,RECIPIENTS_SHEET_ID=1IA5MgL130nSUvhCan2NIhIv7bpxZU1hNK4AChUjMEBI,RECIPIENTS_SHEET_RANGE=Recipients!A:C,DRY_RUN=false'
 ```
 
 取得 URL：
 
 ```bash
-SERVICE_URL=$(gcloud run services describe hk-weather-whatsapp-poc --region asia-east2 --format='value(status.url)')
-echo "$SERVICE_URL"
+SERVICE_URL=$(gcloud run services describe hk-weather-whatsapp-poc \
+  --region asia-east2 \
+  --format='value(status.url)')
 ```
 
 驗證：
@@ -222,18 +191,37 @@ echo "$SERVICE_URL"
 ```bash
 curl "$SERVICE_URL/health"
 curl "$SERVICE_URL/sources"
-curl -X POST "$SERVICE_URL/check"
+curl "$SERVICE_URL/recipients"
 ```
 
-## Firestore 防重複通知
+`/health` 應看到：
 
-Firestore 會保存目前狀態與已成功通知的狀態，因此 Cloud Run restart、scale to zero 或換 instance 後，不會因為忘記舊狀態而重複通知。
+```json
+{
+  "status":"ok",
+  "version":"0.4.1",
+  "state_backend":"firestore",
+  "recipient_mode":"google_sheet"
+}
+```
 
-當某個來源正常，而且之前的事件已經消失時，系統會靜默把該事件重設為 inactive，不另外發「解除」訊息。這樣未來下一次新的 T8／停課事件仍可再次正常通知。
+## 新增使用者的標準流程
+
+```text
+1. 新人在 WhatsApp 完成 CallMeBot activation
+2. 取得自己的 API key
+3. 在 Google Sheet 新增 name / phone / api_key
+4. 管理者執行 /test-recipient?name=新人姓名
+5. 新人收到「設定完成」測試訊息
+6. /recipients 顯示 verified=true
+7. 完成
+```
+
+姓名在 Sheet 中最好保持唯一，因為 `/test-recipient?name=...` 是用姓名找人；如果有兩列同名，endpoint 會回 409，避免測錯人。
 
 ## Cloud Scheduler
 
-每分鐘檢查：
+如果尚未建立：
 
 ```bash
 gcloud scheduler jobs create http hk-weather-check \
@@ -244,13 +232,34 @@ gcloud scheduler jobs create http hk-weather-check \
   --http-method=POST
 ```
 
-提醒：**每分鐘執行 `/check`，不代表每分鐘發 WhatsApp。**
+已存在則更新：
 
-## 尚有限制
+```bash
+gcloud scheduler jobs update http hk-weather-check \
+  --location=asia-east2 \
+  --schedule="* * * * *" \
+  --time-zone="Asia/Hong_Kong" \
+  --uri="$SERVICE_URL/check" \
+  --http-method=POST
+```
 
-- 目前事件解除會靜默重設，尚未另外發送 `✅ 警告已解除` WhatsApp。
-- CallMeBot 適合個人／少量多人 PoC，不適合作為企業大量群發服務。
-- 官方公告措辭可能改變，因此解析規則仍應在真實惡劣天氣事件中持續驗證。
+手動測試：
+
+```bash
+gcloud scheduler jobs run hk-weather-check --location=asia-east2
+```
+
+## 狀態與去重
+
+- Firestore 保存天氣通知 state，Cloud Run restart 或 scale to zero 不會忘記已通知狀態。
+- T1、T3、黃雨只做背景狀態，不發通知。
+- 健康來源不再回報某事件時，系統會靜默清除該事件 state，讓下一次新的事件可以再次通知。
+- 某來源失敗時，不會把該來源之前的事件誤判成解除，也不會阻擋其他來源。
+- 收件人驗證資訊另外存在 `hk_weather_recipient_status`，不混入 Google Sheet。
+
+## 注意
+
+Google Sheet 內含 CallMeBot API key，因此不要設為公開或「知道連結的人都可以查看」。只分享給需要維護的人與 Cloud Run service account。
 
 ## Disclaimer
 
