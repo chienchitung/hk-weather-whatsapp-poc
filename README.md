@@ -127,6 +127,52 @@ Example response:
 | POST | `/test-notification` | Test all recipients |
 | POST | `/test-recipient?name=...` | Test one recipient only |
 
+## Quick test commands
+
+Get the current Cloud Run URL first:
+
+```bash
+SERVICE_URL=$(gcloud run services describe hk-weather-whatsapp-poc \
+  --region asia-east2 \
+  --format='value(status.url)')
+
+echo "$SERVICE_URL"
+```
+
+Then use these commands for routine testing:
+
+```bash
+# 1. Verify Cloud Run version and recipient mode
+curl "$SERVICE_URL/health"
+
+# 2. Check all official sources
+# /sources is GET and the path is lowercase
+curl "$SERVICE_URL/sources"
+
+# 3. View recipient verification status
+curl "$SERVICE_URL/recipients"
+
+# 4. Send a test message to every valid recipient in the Sheet
+curl -X POST "$SERVICE_URL/test-notification"
+
+# 5. Test one recipient only
+TEST_RECIPIENT="Jackie"
+curl -X POST "$SERVICE_URL/test-recipient?name=$TEST_RECIPIENT"
+
+# 6. Run one real weather check manually
+# WhatsApp is only sent if a new actionable state is detected
+curl -X POST "$SERVICE_URL/check"
+```
+
+To test a different new recipient:
+
+```bash
+TEST_RECIPIENT="Amy"
+curl -X POST "$SERVICE_URL/test-recipient?name=$TEST_RECIPIENT"
+```
+
+`/test-notification` sends a setup test to all valid Sheet recipients; `/test-recipient` sends only to the named recipient; `/sources` never sends WhatsApp and is only a source-health check.
+
 ## Deploy / upgrade
 
 ```bash
