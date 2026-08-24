@@ -4,7 +4,7 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import feedparser
 import requests
@@ -32,6 +32,17 @@ class Event:
     scope: str | None = None
 
 
+@dataclass(frozen=True)
+class SourceCheck:
+    name: str
+    source: str
+    url: str
+    ok: bool
+    events_found: int
+    checked_at: str
+    detail: str
+
+
 class Settings:
     phone = os.getenv("CALLMEBOT_PHONE", "")
     api_key = os.getenv("CALLMEBOT_API_KEY", "")
@@ -43,17 +54,17 @@ class Settings:
 
 
 settings = Settings()
-app = FastAPI(title="HK Weather & School WhatsApp PoC", version="0.1.0")
+app = FastAPI(title="HK Weather & School WhatsApp PoC", version="0.2.0")
 
 
 def fetch_json(url: str) -> Any:
-    r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": "hk-weather-whatsapp-poc/0.1"})
+    r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": "hk-weather-whatsapp-poc/0.2"})
     r.raise_for_status()
     return r.json()
 
 
 def fetch_text(url: str) -> str:
-    r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": "hk-weather-whatsapp-poc/0.1"})
+    r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": "hk-weather-whatsapp-poc/0.2"})
     r.raise_for_status()
     return r.text
 
@@ -169,6 +180,8 @@ def parse_entry_time(entry: Any) -> datetime | None:
 
 def recent_entries(feed_text: str) -> list[Any]:
     parsed = feedparser.parse(feed_text)
+    if getattr(parsed, "bozo", False) and not parsed.entries:
+        raise ValueError(f"RSS parse failed: {getattr(parsed, 'bozo_exception', 'unknown error')}")
     cutoff = datetime.now(HKT) - timedelta(hours=settings.rss_max_age_hours)
     output = []
     for entry in parsed.entries:
@@ -183,7 +196,7 @@ def school_scope(text: str) -> str:
     pairs = [
         ("上午校", r"上午校|AM schools?"),
         ("下午校", r"下午校|PM schools?"),
-        ("全日制", r"全日制|whole-day schools?"),
+        ("全日制學校", r"全日制|whole-day schools?"),
         ("夜校", r"夜校|evening schools?"),
     ]
     for label, pattern in pairs:
@@ -204,7 +217,7 @@ def normalize_edb(feed_text: str) -> list[Event]:
                 event_type="SCHOOL_SUSPENSION",
                 status="SUSPENDED",
                 level="ACTION_REQUIRED",
-                title=title or "教育局停課公告",
+                title=title or "教育局公布停課安排",
                 source="香港教育局",
                 source_url=getattr(entry, "link", EDB_RSS_URL),
                 published_at=parse_entry_time(entry).isoformat() if parse_entry_time(entry) else None,
@@ -226,7 +239,7 @@ def normalize_govhk(feed_text: str) -> list[Event]:
                 event_type="EXTREME_CONDITIONS",
                 status="EXTREME_CONDITIONS",
                 level="ACTION_REQUIRED",
-                title=title,
+                title=title or "政府公布極端情況安排",
                 source="香港政府新聞公報",
                 source_url=getattr(entry, "link", GOVHK_RSS_URL),
                 published_at=parse_entry_time(entry).isoformat() if parse_entry_time(entry) else None,
@@ -235,21 +248,53 @@ def normalize_govhk(feed_text: str) -> list[Event]:
     return events
 
 
-def collect_events() -> tuple[list[Event], list[str]]:
+def run_source_check(
+    name: str,
+    source: str,
+    url: str,
+    fn: Callable[[], list[Event]],
+) -> tuple[list[Event], SourceCheck]:
+    checked_at = datetime.now(HKT).isoformat()
+    try:
+        source_events = fn()
+        return source_events, SourceCheck(
+            name=name,
+            source=source,
+            url=url,
+            ok=True,
+            events_found=len(source_events),
+            checked_at=checked_at,
+            detail="來源讀取與解析成功" if source_events else "來源讀取與解析成功，目前沒有符合通知條件的事件",
+        )
+    except Exception as exc:
+        return [], SourceCheck(
+            name=name,
+            source=source,
+            url=url,
+            ok=False,
+            events_found=0,
+            checked_at=checked_at,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def collect_events() -> tuple[list[Event], list[SourceCheck], list[str]]:
     events: list[Event] = []
-    errors: list[str] = []
-    sources = [
-        ("HKO warning summary", lambda: normalize_hko_warning_summary(fetch_json(HKO_WARNING_URL))),
-        ("HKO special weather tips", lambda: normalize_special_weather_tips(fetch_json(HKO_SWT_URL))),
-        ("EDB RSS", lambda: normalize_edb(fetch_text(EDB_RSS_URL))),
-        ("GovHK RSS", lambda: normalize_govhk(fetch_text(GOVHK_RSS_URL))),
+    source_checks: list[SourceCheck] = []
+    definitions = [
+        ("hko_warning_summary", "香港天文台－警告摘要", HKO_WARNING_URL, lambda: normalize_hko_warning_summary(fetch_json(HKO_WARNING_URL))),
+        ("hko_special_weather_tips", "香港天文台－特別天氣提示", HKO_SWT_URL, lambda: normalize_special_weather_tips(fetch_json(HKO_SWT_URL))),
+        ("edb_latest_news", "香港教育局－最新消息", EDB_RSS_URL, lambda: normalize_edb(fetch_text(EDB_RSS_URL))),
+        ("govhk_press_release", "香港政府新聞公報", GOVHK_RSS_URL, lambda: normalize_govhk(fetch_text(GOVHK_RSS_URL))),
     ]
-    for name, fn in sources:
-        try:
-            events.extend(fn())
-        except Exception as exc:
-            errors.append(f"{name}: {type(exc).__name__}: {exc}")
-    return events, errors
+
+    for name, source, url, fn in definitions:
+        source_events, check = run_source_check(name, source, url, fn)
+        events.extend(source_events)
+        source_checks.append(check)
+
+    errors = [f"{check.source}: {check.detail}" for check in source_checks if not check.ok]
+    return events, source_checks, errors
 
 
 def load_state() -> dict[str, str]:
@@ -266,24 +311,76 @@ def save_state(state: dict[str, str]) -> None:
     settings.state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def human_status(status: str | None) -> str | None:
+    labels = {
+        "T1": "一號戒備信號",
+        "T3": "三號強風信號",
+        "T8": "八號烈風或暴風信號",
+        "T9": "九號烈風或暴風風力增強信號",
+        "T10": "十號颶風信號",
+        "PRE_T8": "天文台預告可能發出八號信號",
+        "AMBER_RAIN": "黃色暴雨警告",
+        "RED_RAIN": "紅色暴雨警告",
+        "BLACK_RAIN": "黑色暴雨警告",
+        "EXTREME_CONDITIONS": "極端情況",
+        "SUSPENDED": "停課",
+        "TEST": "測試",
+    }
+    return labels.get(status, status) if status else None
+
+
+def message_heading(event: Event) -> tuple[str, str]:
+    if event.event_type == "SCHOOL_SUSPENSION":
+        return "🎓", "停課通知｜教育局最新安排"
+    if event.status in {"T8", "T9", "T10"}:
+        return "🔴", f"香港天氣警報｜{human_status(event.status)}已生效"
+    if event.status == "BLACK_RAIN":
+        return "🔴", "香港天氣警報｜黑色暴雨警告已生效"
+    if event.status == "RED_RAIN":
+        return "⚠️", "香港天氣提醒｜紅色暴雨警告已生效"
+    if event.status == "PRE_T8":
+        return "⚠️", "香港天氣提醒｜天文台預告可能發出八號信號"
+    if event.status == "EXTREME_CONDITIONS":
+        return "🔴", "政府特別通知｜極端情況安排"
+    if event.event_type == "TEST":
+        return "✅", "通知測試成功"
+    return "ℹ️", f"香港天氣更新｜{human_status(event.status)}"
+
+
+def action_text(event: Event) -> str:
+    if event.event_type == "SCHOOL_SUSPENSION":
+        return "請家長及學生留意教育局的最新安排，並以官方公告為準。"
+    if event.status in {"T8", "T9", "T10", "BLACK_RAIN", "EXTREME_CONDITIONS"}:
+        return "請避免不必要外出，留意交通及安全情況；工作安排請依公司內部惡劣天氣政策執行。"
+    if event.status in {"PRE_T8", "RED_RAIN"}:
+        return "請提前留意交通及天氣變化，並準備依公司內部惡劣天氣政策調整安排。"
+    if event.event_type == "TEST":
+        return "這是一則測試訊息，代表 Cloud Run → CallMeBot → WhatsApp 通知鏈路運作正常。"
+    return "請持續留意香港天文台及相關政府部門的最新公告。"
+
+
 def format_message(event: Event, previous: str | None) -> str:
-    icon = "🔴" if event.level == "ACTION_REQUIRED" else "⚠️" if event.level == "PREPARE" else "ℹ️"
+    icon, heading = message_heading(event)
     lines = [
-        f"{icon} *香港惡劣天氣／停課通知*",
+        f"{icon} *{heading}*",
         "",
         event.title,
-        f"狀態：{event.status}",
     ]
+
+    if event.event_type != "TEST":
+        lines.append(f"目前狀況：{human_status(event.status)}")
     if event.scope:
         lines.append(f"適用範圍：{event.scope}")
-    if previous:
-        lines.append(f"前一狀態：{previous}")
+    if previous and previous != event.status:
+        lines.append(f"前一狀況：{human_status(previous)}")
+
     lines.extend([
-        f"資料來源：{event.source}",
-        f"官方連結：{event.source_url}",
-        f"更新時間：{datetime.now(HKT).strftime('%Y-%m-%d %H:%M HKT')}",
         "",
-        "注意：工作安排仍應依公司內部政策執行。",
+        f"📌 {action_text(event)}",
+        "",
+        f"發布單位：{event.source}",
+        f"更新時間：{datetime.now(HKT).strftime('%Y-%m-%d %H:%M HKT')}",
+        f"官方公告：{event.source_url}",
     ])
     return "\n".join(lines)
 
@@ -303,7 +400,7 @@ def send_whatsapp(message: str) -> dict[str, Any]:
 
 
 def process_once() -> dict[str, Any]:
-    events, errors = collect_events()
+    events, source_checks, errors = collect_events()
     previous_state = load_state()
     first_run = not bool(previous_state)
     next_state = dict(previous_state)
@@ -322,8 +419,11 @@ def process_once() -> dict[str, Any]:
         notifications.append({"event": asdict(event), "action": "notify", "result": result})
 
     save_state(next_state)
+    all_sources_ok = all(check.ok for check in source_checks)
     return {
         "checked_at": datetime.now(HKT).isoformat(),
+        "source_health": "ok" if all_sources_ok else "degraded",
+        "sources": [asdict(check) for check in source_checks],
         "events": [asdict(e) for e in events],
         "notifications": notifications,
         "errors": errors,
@@ -333,7 +433,18 @@ def process_once() -> dict[str, Any]:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": "0.2.0"}
+
+
+@app.get("/sources")
+def sources() -> dict[str, Any]:
+    _, source_checks, errors = collect_events()
+    return {
+        "checked_at": datetime.now(HKT).isoformat(),
+        "source_health": "ok" if all(check.ok for check in source_checks) else "degraded",
+        "sources": [asdict(check) for check in source_checks],
+        "errors": errors,
+    }
 
 
 @app.post("/check")
@@ -347,10 +458,10 @@ def test_notification() -> dict[str, Any]:
         key="test:notification",
         event_type="TEST",
         status="TEST",
-        level="PREPARE",
-        title="PoC 測試通知：香港惡劣天氣監控服務已連線",
-        source="PoC",
-        source_url="https://www.gov.hk/tc/about/rss.htm",
+        level="INFO",
+        title="香港惡劣天氣通知服務已成功連線。",
+        source="HK Weather WhatsApp PoC",
+        source_url="https://github.com/chienchitung/hk-weather-whatsapp-poc",
     )
     try:
         return send_whatsapp(format_message(event, None))
