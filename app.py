@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 import feedparser
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from google.auth import default as google_auth_default
 from google.cloud import firestore
 from googleapiclient.discovery import build
@@ -65,26 +65,24 @@ class Recipient:
     name: str
     phone: str
     api_key: str
-    enabled: bool = True
-    language: str = "zh-TW"
 
 
 class Settings:
     phone = os.getenv("CALLMEBOT_PHONE", "")
     api_key = os.getenv("CALLMEBOT_API_KEY", "")
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
-    bootstrap_silent = os.getenv("BOOTSTRAP_SILENT", "true").lower() == "true"
     rss_max_age_hours = int(os.getenv("RSS_MAX_AGE_HOURS", "12"))
     request_timeout = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
     state_backend = os.getenv("STATE_BACKEND", "firestore" if os.getenv("K_SERVICE") else "local").lower()
     state_path = Path(os.getenv("STATE_PATH", "/tmp/hk-weather-whatsapp-state.json"))
     firestore_collection = os.getenv("FIRESTORE_COLLECTION", "hk_weather_notification_state")
+    recipient_status_collection = os.getenv("RECIPIENT_STATUS_COLLECTION", "hk_weather_recipient_status")
     recipients_sheet_id = os.getenv("RECIPIENTS_SHEET_ID", "").strip()
-    recipients_sheet_range = os.getenv("RECIPIENTS_SHEET_RANGE", "Recipients!A:F").strip()
+    recipients_sheet_range = os.getenv("RECIPIENTS_SHEET_RANGE", "Recipients!A:C").strip()
 
 
 settings = Settings()
-app = FastAPI(title="HK Weather & School WhatsApp Notification", version="0.4.0")
+app = FastAPI(title="HK Weather & School WhatsApp Notification", version="0.4.1")
 
 
 def now_hkt() -> str:
@@ -92,26 +90,25 @@ def now_hkt() -> str:
 
 
 def fetch_json(url: str) -> Any:
-    r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": "hk-weather-whatsapp-poc/0.4"})
+    r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": "hk-weather-whatsapp-poc/0.4.1"})
     r.raise_for_status()
     return r.json()
 
 
 def fetch_text(url: str) -> str:
-    r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": "hk-weather-whatsapp-poc/0.4"})
+    r = requests.get(url, timeout=settings.request_timeout, headers={"User-Agent": "hk-weather-whatsapp-poc/0.4.1"})
     r.raise_for_status()
     return r.text
 
 
 def detect_typhoon_status(text: str) -> str | None:
-    checks = [
+    for pattern, status in [
         (r"(?:十號|10號|No\.\s*10)", "T10"),
         (r"(?:九號|9號|No\.\s*9)", "T9"),
         (r"(?:八號|8號|No\.\s*8)", "T8"),
         (r"(?:三號|3號|No\.\s*3)", "T3"),
         (r"(?:一號|1號|No\.\s*1)", "T1"),
-    ]
-    for pattern, status in checks:
+    ]:
         if re.search(pattern, text, flags=re.I):
             return status
     return None
@@ -206,8 +203,10 @@ def recent_entries(feed_text: str) -> list[Any]:
 def school_scope(text: str) -> str:
     scopes = []
     for label, pattern in [
-        ("上午校", r"上午校|AM schools?"), ("下午校", r"下午校|PM schools?"),
-        ("全日制學校", r"全日制|whole-day schools?"), ("夜校", r"夜校|evening schools?"),
+        ("上午校", r"上午校|AM schools?"),
+        ("下午校", r"下午校|PM schools?"),
+        ("全日制學校", r"全日制|whole-day schools?"),
+        ("夜校", r"夜校|evening schools?"),
     ]:
         if re.search(pattern, text, flags=re.I):
             scopes.append(label)
@@ -366,13 +365,26 @@ def format_message(event: Event, previous: str | None) -> str:
         lines.append(f"適用範圍：{event.scope}")
     if previous:
         lines.append(f"前一狀況：{human_status(previous)}")
-    lines.extend(["", f"📌 {action_text(event)}", "", f"發布單位：{event.source}",
-                  f"更新時間：{datetime.now(HKT).strftime('%Y-%m-%d %H:%M HKT')}", f"官方公告：{event.source_url}"])
+    lines.extend([
+        "", f"📌 {action_text(event)}", "", f"發布單位：{event.source}",
+        f"更新時間：{datetime.now(HKT).strftime('%Y-%m-%d %H:%M HKT')}",
+        f"官方公告：{event.source_url}",
+    ])
     return "\n".join(lines)
 
 
-def bool_value(value: Any) -> bool:
-    return str(value).strip().lower() in {"true", "1", "yes", "y", "是", "啟用"}
+def onboarding_message(name: str) -> str:
+    return "\n".join([
+        "✅ *香港天氣通知服務｜設定完成*",
+        "",
+        f"Hi {name}，",
+        "",
+        "你已成功加入香港惡劣天氣通知服務。",
+        "之後當香港天文台、教育局或政府發布符合通知條件的重要資訊時，你會在這裡收到 WhatsApp 通知。",
+        "",
+        "這是一則測試訊息，不代表目前有惡劣天氣警告。",
+        f"設定時間：{datetime.now(HKT).strftime('%Y-%m-%d %H:%M HKT')}",
+    ])
 
 
 def load_sheet_recipients() -> list[Recipient]:
@@ -391,14 +403,11 @@ def load_sheet_recipients() -> list[Recipient]:
         values = dict(zip(headers, row))
         phone = str(values.get("phone", "")).strip()
         api_key = str(values.get("api_key", "")).strip()
-        enabled = bool_value(values.get("enabled", "true"))
-        if enabled and phone and api_key:
+        if phone and api_key:
             recipients.append(Recipient(
                 name=str(values.get("name", phone)).strip() or phone,
                 phone=phone,
                 api_key=api_key,
-                enabled=True,
-                language=str(values.get("language", "zh-TW")).strip() or "zh-TW",
             ))
     return recipients
 
@@ -414,7 +423,11 @@ def get_recipients() -> list[Recipient]:
 def send_one_whatsapp(recipient: Recipient, message: str) -> dict[str, Any]:
     if settings.dry_run:
         return {"recipient": recipient.name, "sent": False, "dry_run": True}
-    r = requests.get(CALLMEBOT_URL, params={"phone": recipient.phone, "text": message, "apikey": recipient.api_key}, timeout=settings.request_timeout)
+    r = requests.get(
+        CALLMEBOT_URL,
+        params={"phone": recipient.phone, "text": message, "apikey": recipient.api_key},
+        timeout=settings.request_timeout,
+    )
     r.raise_for_status()
     return {"recipient": recipient.name, "sent": True, "status_code": r.status_code, "response": r.text[:200]}
 
@@ -422,7 +435,7 @@ def send_one_whatsapp(recipient: Recipient, message: str) -> dict[str, Any]:
 def send_whatsapp(message: str) -> dict[str, Any]:
     recipients = get_recipients()
     if not recipients:
-        raise RuntimeError("No enabled WhatsApp recipients are configured")
+        raise RuntimeError("No WhatsApp recipients are configured")
     results = []
     for recipient in recipients:
         try:
@@ -431,6 +444,34 @@ def send_whatsapp(message: str) -> dict[str, Any]:
             results.append({"recipient": recipient.name, "sent": False, "error": f"{type(exc).__name__}: {exc}"})
     sent_count = sum(1 for r in results if r.get("sent") is True)
     return {"sent": sent_count > 0, "sent_count": sent_count, "recipient_count": len(recipients), "results": results}
+
+
+def recipient_status_client():
+    if settings.state_backend != "firestore":
+        raise RuntimeError("Recipient verification requires Firestore")
+    return firestore.Client().collection(settings.recipient_status_collection)
+
+
+def recipient_doc_id(phone: str) -> str:
+    return re.sub(r"\D", "", phone) or phone.replace("/", "_")
+
+
+def save_recipient_test_status(recipient: Recipient, result: dict[str, Any]) -> None:
+    collection = recipient_status_client()
+    success = result.get("sent") is True
+    collection.document(recipient_doc_id(recipient.phone)).set({
+        "name": recipient.name,
+        "phone_last4": recipient.phone[-4:],
+        "verified": success,
+        "last_test_status": "success" if success else "failed",
+        "last_test_at": now_hkt(),
+        "last_test_error": result.get("error"),
+    }, merge=True)
+
+
+def load_recipient_statuses() -> dict[str, dict[str, Any]]:
+    collection = recipient_status_client()
+    return {doc.id: (doc.to_dict() or {}) for doc in collection.stream()}
 
 
 def response_payload(source_checks: list[SourceCheck], events: list[Event], errors: list[str], notifications: list[dict[str, Any]], decision: str) -> dict[str, Any]:
@@ -473,8 +514,6 @@ def process_once() -> dict[str, Any]:
     notifications: list[dict[str, Any]] = []
     active_by_key = {event.key: event for event in events}
 
-    # A healthy source that no longer reports a previously active event silently
-    # resets that event. A failed source leaves its previous state untouched.
     for source_id, keys in SOURCE_EVENT_KEYS.items():
         check = checks_by_name.get(source_id)
         if not check or not check.ok:
@@ -535,19 +574,59 @@ def process_once() -> dict[str, Any]:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "HK Weather & School WhatsApp Notification", "version": "0.4.0", "docs": "/docs", "health": "/health", "sources": "/sources"}
+    return {
+        "service": "HK Weather & School WhatsApp Notification",
+        "version": "0.4.1",
+        "docs": "/docs",
+        "health": "/health",
+        "sources": "/sources",
+        "recipients": "/recipients",
+    }
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "version": "0.4.0", "state_backend": settings.state_backend,
-            "recipient_mode": "google_sheet" if settings.recipients_sheet_id else "environment"}
+    return {
+        "status": "ok",
+        "version": "0.4.1",
+        "state_backend": settings.state_backend,
+        "recipient_mode": "google_sheet" if settings.recipients_sheet_id else "environment",
+    }
 
 
 @app.get("/sources")
 def sources() -> dict[str, Any]:
     _, checks, errors = collect_events()
     return {"source_health": "ok" if not errors else "degraded", "sources": [asdict(c) for c in checks], "errors": errors}
+
+
+@app.get("/recipients")
+def recipients_status() -> dict[str, Any]:
+    try:
+        recipients = get_recipients()
+        statuses = load_recipient_statuses() if settings.state_backend == "firestore" else {}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    output = []
+    verified_count = 0
+    for recipient in recipients:
+        status = statuses.get(recipient_doc_id(recipient.phone), {})
+        verified = bool(status.get("verified"))
+        if verified:
+            verified_count += 1
+        output.append({
+            "name": recipient.name,
+            "verified": verified,
+            "last_test_status": status.get("last_test_status"),
+            "last_test_at": status.get("last_test_at"),
+        })
+    return {
+        "total": len(output),
+        "verified": verified_count,
+        "unverified": len(output) - verified_count,
+        "recipients": output,
+    }
 
 
 @app.post("/check")
@@ -565,6 +644,38 @@ def test_notification() -> dict[str, Any]:
         return send_whatsapp(format_message(event, None))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/test-recipient")
+def test_recipient(name: str = Query(..., min_length=1)) -> dict[str, Any]:
+    try:
+        matches = [r for r in get_recipients() if r.name.casefold() == name.strip().casefold()]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to read recipients: {exc}") from exc
+
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"Recipient '{name}' was not found in Google Sheet")
+    if len(matches) > 1:
+        raise HTTPException(status_code=409, detail=f"More than one recipient is named '{name}'. Names must be unique for onboarding tests.")
+
+    recipient = matches[0]
+    try:
+        result = send_one_whatsapp(recipient, onboarding_message(recipient.name))
+    except Exception as exc:
+        result = {"recipient": recipient.name, "sent": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    if settings.state_backend == "firestore" and not settings.dry_run:
+        try:
+            save_recipient_test_status(recipient, result)
+        except Exception as exc:
+            result["verification_state_error"] = str(exc)
+
+    return {
+        "recipient": recipient.name,
+        "sent": result.get("sent", False),
+        "dry_run": settings.dry_run,
+        "result": result,
+    }
 
 
 if __name__ == "__main__":
