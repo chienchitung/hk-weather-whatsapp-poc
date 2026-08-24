@@ -4,7 +4,27 @@
 
 英文版：[README.md](README.md)
 
-## 目前監控來源
+## 系統架構
+
+```text
+Cloud Scheduler（每分鐘）
+        ↓
+Cloud Run /check
+        ↓
+HKO / EDB / GovHK
+        ↓
+來源健康檢查
+        ↓
+事件標準化
+        ↓
+Firestore 永久狀態
+        ↓
+通知白名單 + 去重
+        ↓ 只有真正的新事件
+CallMeBot → WhatsApp
+```
+
+## 官方來源
 
 | 官方來源 | 用途 |
 |---|---|
@@ -13,64 +33,34 @@
 | 香港教育局 RSS | 正式停課公告 |
 | 香港政府新聞公報 RSS | 極端情況及政府特別公告 |
 
-上述香港政府資料來源不需要 API Key。
-
-## 系統架構
-
-```text
-Cloud Scheduler
-      ↓ 每分鐘
-Cloud Run /check
-      ↓
-HKO / EDB / GovHK
-      ↓
-確認所有來源健康
-      ↓
-事件標準化
-      ↓
-Firestore 永久狀態
-      ↓
-通知白名單 + 去重
-      ↓ 只有真正的新事件
-CallMeBot
-      ↓
-WhatsApp
-```
+上述香港政府資料來源都不需要 API Key。
 
 ## v0.3.1 如何避免亂發通知
 
-這一版採取偏保守的通知策略：
+這一版採取偏保守的策略：
 
-1. **Firestore 永久保存狀態**：Cloud Run 重啟、scale to zero 或換 instance 後，不會忘記先前已經通知過的事件。
-2. **任何來源失敗就不發通知（fail closed）**：如果 HKO、EDB、GovHK 任一來源抓取失敗，當次 `/check` 不會更新狀態，也不會呼叫 CallMeBot。
-3. **Firestore 無法讀寫也不發通知**：狀態資料庫是安全機制的一部分，資料庫異常時寧可不通知，也不要誤報。
-4. **只有白名單事件會通知**：`PRE_T8`、T8、T9、T10、紅雨、黑雨、極端情況、教育局停課。
-5. **T1、T3、黃雨只記錄、不主動通知**：這些資訊保留作為狀態背景，但不打擾使用者。
-6. **同一狀態只通知一次**：Cloud Scheduler 即使每分鐘跑一次，只要狀態沒有改變，就不會再次傳 WhatsApp。
-7. **部署基準與未來真事件分開**：系統會在 Firestore 寫入 `bootstrap_complete`。因此部署當下就算沒有任何警報，幾天後第一次真的發生 T8，仍會正常通知，不會被誤當成首次啟動而略過。
-8. **CallMeBot 真正成功後才標記為已通知**：若傳送失敗，系統不會把該狀態誤記成已送達。
+- **Firestore 永久保存通知狀態**：Cloud Run restart、scale to zero 或更換 instance 後，不會忘記之前已通知過什麼。
+- **任何官方來源失敗就不通知（fail closed）**：HKO、EDB、GovHK 任一來源異常，該次 `/check` 不更新狀態、不呼叫 CallMeBot。
+- **Firestore 無法讀寫也不通知**：狀態資料庫異常時寧可不發，也不要誤報。
+- **只有通知白名單會發 WhatsApp**：Pre-T8、T8、T9、T10、紅雨、黑雨、極端情況、教育局停課。
+- **T1、T3、黃雨只記錄，不主動通知**。
+- **同一狀態只通知一次**：每分鐘檢查不等於每分鐘通知。
+- **永久 bootstrap 標記**：即使部署當下沒有任何事件，系統仍會寫入 `bootstrap_complete`；未來第一次真的出現 T8 時會正常通知，不會被錯當成首次啟動。
+- **CallMeBot 成功後才標記已通知**：若傳送失敗，不會誤記為已送達。
+- **建議 Cloud Run 限制為單 worker**：`--max-instances=1 --concurrency=1`，降低排程重疊或手動重複呼叫造成同時處理的風險。
 
-因此：
-
-```text
-每分鐘 Cloud Run 檢查 ≠ 每分鐘 WhatsApp 通知
-```
-
-正常範例：
+例如：
 
 ```text
 10:01 無事件 → 不通知
-10:02 無事件 → 不通知
-10:30 T3 → 只記錄，不通知
+10:30 T3 → 只記錄
 11:00 Pre-T8 → 通知一次
 11:01 Pre-T8 → 不通知
 12:00 T8 → 通知一次
 12:01 T8 → 不通知
 ```
 
-## 真人閱讀的 WhatsApp 格式
-
-例如 T8：
+## 真人閱讀的通知格式
 
 ```text
 🔴 香港天氣警報｜八號烈風或暴風信號已生效
@@ -86,39 +76,23 @@ WhatsApp
 官方公告：https://...
 ```
 
-停課：
-
-```text
-🎓 停課通知｜教育局最新安排
-
-教育局宣布上午校及全日制學校停課
-目前狀況：停課
-適用範圍：上午校、全日制學校
-
-📌 請家長及學生留意教育局的最新安排，並以官方公告為準。
-
-發布單位：香港教育局
-更新時間：2026-08-24 16:10 HKT
-官方公告：https://...
-```
-
 ## API 端點
 
 | Method | Endpoint | 用途 |
 |---|---|---|
 | GET | `/` | 服務基本資訊 |
-| GET | `/health` | Cloud Run 與 state backend 狀態 |
-| GET | `/sources` | 個別確認四個官方來源是否成功 |
+| GET | `/health` | 服務版本及 state backend |
+| GET | `/sources` | 個別確認所有官方來源 |
 | POST | `/check` | 正式檢查並依規則決定是否通知 |
 | POST | `/test-notification` | 手動測試 WhatsApp |
 
-### 確認所有官方來源
+### 如何確認所有來源都成功
 
 ```bash
 curl "$SERVICE_URL/sources"
 ```
 
-健康狀態應看到：
+健康時應看到：
 
 ```json
 {
@@ -133,11 +107,11 @@ curl "$SERVICE_URL/sources"
 }
 ```
 
-`events_found: 0` 的意思是「成功抓到來源，只是目前沒有符合條件的事件」，不是抓取失敗。
+`events_found: 0` 表示「來源成功，只是目前沒有事件」，不是抓取失敗。
 
 ---
 
-# Google Cloud 從頭部署
+# Google Cloud 部署
 
 Repository：
 
@@ -160,16 +134,16 @@ gcloud billing projects describe YOUR_PROJECT_ID
 billingEnabled: true
 ```
 
-## 2. Clone 最新版本
+## 2. 取得最新程式
 
-如果 Cloud Shell 已經 clone 過：
+Cloud Shell 已經 clone 過：
 
 ```bash
 cd ~/hk-weather-whatsapp-poc
 git pull
 ```
 
-如果要重新開始：
+重新 clone：
 
 ```bash
 cd ~
@@ -178,7 +152,7 @@ git clone https://github.com/chienchitung/hk-weather-whatsapp-poc.git
 cd hk-weather-whatsapp-poc
 ```
 
-## 3. 啟用 API
+## 3. 啟用必要 API
 
 ```bash
 gcloud services enable \
@@ -191,19 +165,19 @@ gcloud services enable \
 
 ## 4. Cloud Build IAM
 
-我們實際部署時曾遇到：
+實際部署時曾遇到：
 
 ```text
 Build failed because the default service account is missing required IAM permissions
 ```
 
-先確認 Cloud Build 使用的帳號：
+先確認 build account：
 
 ```bash
 gcloud builds get-default-service-account
 ```
 
-再給它 Cloud Run Builder：
+再授權：
 
 ```bash
 gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
@@ -219,23 +193,19 @@ gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
 gcloud firestore databases list
 ```
 
-如果還沒有 `(default)` database：
+如果沒有 `(default)` database：
 
 ```bash
-gcloud firestore databases create \
-  --location=asia-east2 \
-  --type=firestore-native
+gcloud firestore databases create --location=asia-east2 --type=firestore-native
 ```
 
-Firestore 的香港區域支援 `asia-east2`。
-
-系統會自動建立 collection：
+系統之後會自動建立 collection：
 
 ```text
 hk_weather_notification_state
 ```
 
-不需要手動建立 collection。
+不需要手動建 collection。
 
 ## 6. 給 Cloud Run Firestore 權限
 
@@ -250,19 +220,27 @@ gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
   --role="roles/datastore.user"
 ```
 
-## 7. 先用 DRY RUN 部署
+## 7A. 第一次乾淨部署
 
-為避免 Cloud Shell 換行符號操作錯誤，第一次建議直接使用單行：
+第一次部署可以用：
 
 ```bash
-gcloud run deploy hk-weather-whatsapp-poc --source . --region asia-east2 --allow-unauthenticated --set-env-vars DRY_RUN=true,BOOTSTRAP_SILENT=true,STATE_BACKEND=firestore
+gcloud run deploy hk-weather-whatsapp-poc --source . --region asia-east2 --allow-unauthenticated --max-instances=1 --concurrency=1 --set-env-vars DRY_RUN=true,BOOTSTRAP_SILENT=true,STATE_BACKEND=firestore
 ```
 
-成功後會得到：
+注意：`--set-env-vars` 會先清除原本環境變數，因此只建議在第一次乾淨部署使用。
 
-```text
-Service URL: https://...
+## 7B. 你目前這種「已經有 CallMeBot 設定」的升級方式
+
+如果 Cloud Run 已經有 `CALLMEBOT_PHONE`、`CALLMEBOT_API_KEY`，請不要再用 `--set-env-vars`，否則會把它們清掉。
+
+請使用：
+
+```bash
+gcloud run deploy hk-weather-whatsapp-poc --source . --region asia-east2 --allow-unauthenticated --max-instances=1 --concurrency=1 --update-env-vars STATE_BACKEND=firestore,BOOTSTRAP_SILENT=true
 ```
+
+`--update-env-vars` 只更新指定的 key，因此會保留既有 CallMeBot 設定。
 
 ## 8. 設定 SERVICE_URL
 
@@ -274,15 +252,15 @@ SERVICE_URL=$(gcloud run services describe hk-weather-whatsapp-poc \
 echo "$SERVICE_URL"
 ```
 
-之前看到：
+之前如果看到：
 
 ```text
 curl: (3) URL rejected: No host part in the URL
 ```
 
-就是因為 `$SERVICE_URL` 尚未被設定，而不是 Cloud Run 本身壞掉。
+代表 `$SERVICE_URL` 還沒設定，而不是服務壞掉。
 
-## 9. 驗證新版
+## 9. 驗證新版安全狀態
 
 ```bash
 curl "$SERVICE_URL/health"
@@ -290,42 +268,50 @@ curl "$SERVICE_URL/sources"
 curl -X POST "$SERVICE_URL/check"
 ```
 
-`/health` 應顯示：
+`/health` 應該看到：
 
 ```json
-{
-  "status": "ok",
-  "version": "0.3.1",
-  "state_backend": "firestore"
-}
+{"status":"ok","version":"0.3.1","state_backend":"firestore"}
 ```
 
-第一次 `/check` 正常應出現：
+新 Firestore 第一次 `/check` 應該看到：
 
 ```text
 decision: bootstrap_completed_no_notification
 ```
 
-這就是建立 Firestore 安全基準，不會發 WhatsApp。
+這表示安全基準已建立，而且不會發 WhatsApp。
 
-之後每次正常執行則為：
+之後正常執行為：
 
 ```text
 decision: completed
 ```
 
+如果官方來源或 Firestore 有問題，會看到類似：
+
+```text
+decision: fail_closed_source_error
+```
+
+或：
+
+```text
+decision: fail_closed_state_error
+```
+
+這時 `notifications` 會保持空白，不會亂發訊息。
+
 ## 10. CallMeBot
 
-確認 Cloud Run、Firestore、來源都正常後，再開啟正式通知。
+不要把真實電話與 API Key commit 到 GitHub。長期使用建議改用 Secret Manager。
 
-不要把真實 API Key commit 到 GitHub。
-
-PoC 可以先使用 Cloud Run environment variables；較正式建議改用 Secret Manager。
+既有服務可以使用：
 
 ```bash
 gcloud run services update hk-weather-whatsapp-poc \
   --region asia-east2 \
-  --update-env-vars CALLMEBOT_PHONE=YOUR_PHONE,CALLMEBOT_API_KEY=YOUR_KEY,DRY_RUN=false,BOOTSTRAP_SILENT=true,STATE_BACKEND=firestore
+  --update-env-vars CALLMEBOT_PHONE=YOUR_PHONE,CALLMEBOT_API_KEY=YOUR_KEY,DRY_RUN=false,STATE_BACKEND=firestore
 ```
 
 測試：
@@ -334,7 +320,7 @@ gcloud run services update hk-weather-whatsapp-poc \
 curl -X POST "$SERVICE_URL/test-notification"
 ```
 
-若 CallMeBot API 回 HTTP 200，但 WhatsApp 沒收到，重新在 WhatsApp 傳送 CallMeBot 授權訊息後再測。
+如果 API 回 200 但 WhatsApp 沒收到，重新在 WhatsApp 啟用 CallMeBot 授權後再測。
 
 ## 11. Cloud Scheduler
 
@@ -353,11 +339,7 @@ gcloud scheduler jobs create http hk-weather-check \
 gcloud scheduler jobs run hk-weather-check --location=asia-east2
 ```
 
-查看：
-
-```bash
-gcloud scheduler jobs list --location=asia-east2
-```
+提醒：**每分鐘執行 `/check`，不代表每分鐘發 WhatsApp。**
 
 ---
 
@@ -370,33 +352,15 @@ pip install -r requirements.txt
 export STATE_BACKEND=local
 export DRY_RUN=true
 python app.py
-```
-
-測試：
-
-```bash
 pytest -q
 ```
 
-## 環境變數
+## 尚未完成
 
-| 變數 | 說明 |
-|---|---|
-| `DRY_RUN` | `true` 時不真正送 WhatsApp |
-| `BOOTSTRAP_SILENT` | 啟動時建立安全基準 |
-| `STATE_BACKEND` | `local` 或 `firestore` |
-| `FIRESTORE_COLLECTION` | Firestore collection 名稱 |
-| `CALLMEBOT_PHONE` | CallMeBot 啟用的電話 |
-| `CALLMEBOT_API_KEY` | CallMeBot API Key |
-| `RSS_MAX_AGE_HOURS` | RSS 公告回看時間 |
-| `REQUEST_TIMEOUT_SECONDS` | 官方來源 timeout |
-
-## 尚未完成的功能
-
-- 警告解除（例如 T8 → 完全取消）尚未完整建模成 `✅ 已解除` 通知。
-- CallMeBot 適合個人／少量 PoC，不適合作為大型企業群發服務。
-- 如果未來需要多人收件，建議加入 Google Sheet 收件人管理層，正式環境再轉 WhatsApp Business Cloud API。
-- 官方公告措辭可能改變，因此 regex 規則仍應在真實惡劣天氣事件期間持續驗證。
+- 警告解除（例如 T8 → 警告完全取消）的 `✅ 已解除` 通知尚未完整建模。
+- CallMeBot 適合個人／少量 PoC，不適合作為企業大量群發。
+- 未來多人收件可以加入 Google Sheet 收件人管理層，正式環境再轉 WhatsApp Business Cloud API。
+- 官方公告措辭可能改變，因此解析規則仍應在真實天氣事件中持續驗證。
 
 ## Disclaimer
 
